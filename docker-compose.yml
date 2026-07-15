@@ -1,0 +1,57 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: competence_pg
+    environment:
+      POSTGRES_USER: competence
+      POSTGRES_PASSWORD: competence
+      POSTGRES_DB: competence_platform
+    ports:
+      # 5433, чтобы не конфликтовать с Homebrew postgresql@14 на 5432
+      - "5433:5432"
+    volumes:
+      - competence_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U competence -d competence_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: competence_app
+    env_file:
+      - .env.docker
+    environment:
+      DATABASE_URL: postgresql+psycopg2://competence:competence@db:5432/competence_platform
+      SEED_ON_START: ${SEED_ON_START:-1}
+      SEED_CSV_PATH: /data/final_vacancies.csv
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/app/scripts/docker_entrypoint.sh"]
+    restart: "no"
+
+  # Опционально: живой парсер hh.ru
+  # docker compose run --rm parser --limit-per-query 5
+  parser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["parse"]
+    env_file:
+      - .env.docker
+    environment:
+      DATABASE_URL: postgresql+psycopg2://competence:competence@db:5432/competence_platform
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["python", "-m", "src.market.parse_hh"]
+
+volumes:
+  competence_pg_data:
