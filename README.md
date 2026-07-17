@@ -48,6 +48,37 @@ SEED_ON_START=1 docker compose run --rm app
 PYTHONPATH=. python -m src.market.seed_from_hh_united
 ```
 
+Сборка market-графа (нормализация → canonical → рёбра с трендом):
+
+```bash
+PYTHONPATH=. python -m src.graph.build_market_graph
+
+docker compose exec db psql -U competence -d competence_platform \
+  -c "SELECT edge_type, count(*) FROM graph_edges GROUP BY 1;"
+```
+
+Синтетика сотрудников + org-слой графа:
+
+```bash
+PYTHONPATH=. python -m src.org.generate_synthetic
+PYTHONPATH=. python -m src.org.build_org_graph
+
+# дефициты роль vs рынок
+PYTHONPATH=. python -m src.org.skill_gaps --role data_science
+PYTHONPATH=. python -m src.org.skill_gaps --role llm_agents
+
+# рекомендации (обучение / курсы / мобильность)
+PYTHONPATH=. python -m src.org.recommendations --role data_science
+
+# HR Dashboard
+PYTHONPATH=. streamlit run app_streamlit.py
+
+# LLM-ассистент (8 сценариев; без GROQ_API_KEY — ответ по фактам)
+PYTHONPATH=. python -m src.llm.ask --list
+PYTHONPATH=. python -m src.llm.ask --scenario gaps_ds --no-llm
+PYTHONPATH=. python -m src.llm.ask -q "Кого обучить по MLOps?"
+```
+
 Парсер hh.ru (когда API доступен):
 
 ```bash
@@ -75,9 +106,13 @@ docker compose down
 
 - `docker-compose.yml` — Postgres + app (init/seed) + parser
 - `Dockerfile` — образ приложения
-- `data/final_vacancies.csv` — seed рынка (DS/ML/AI)
+- `data/` — seed рынка (DS/ML/AI)
 - `src/db` — модели Postgres
 - `src/market` — парсер hh.ru и seed
+- `src/graph` — нормализация навыков и market-граф
+- `src/org` — синтетика сотрудников, org-граф, дефициты, рекомендации
+- `src/llm` — сценарии и ассистент (Groq / fallback)
+- `app_streamlit.py` — HR Dashboard
 
 ## Примечание про hh.ru
 

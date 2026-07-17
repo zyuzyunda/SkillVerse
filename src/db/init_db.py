@@ -1,4 +1,18 @@
-from src.db.models import ParseRun, SkillCanonical, Vacancy, VacancySkill
+from src.db.models import (
+    Course,
+    CourseSkill,
+    Department,
+    Employee,
+    EmployeeSkill,
+    GraphEdge,
+    GraphNode,
+    ParseRun,
+    Position,
+    SkillAlias,
+    SkillCanonical,
+    Vacancy,
+    VacancySkill,
+)
 from src.db.session import Base, engine
 
 
