@@ -27,9 +27,6 @@ from src.db.session import Base, SessionLocal, engine
 from src.graph.clusters import assign_cluster, cluster_code
 from src.graph.normalize import SkillNormalizer, normalize_text
 
-# граница между «ранним» и «поздним» срезом (helper vs yandex_coach)
-PERIOD_SPLIT = datetime(2025, 6, 1, tzinfo=timezone.utc)
-
 SUPPORT_WEIGHT = 0.7
 TREND_WEIGHT = 0.3
 
@@ -44,6 +41,7 @@ MIN_SUPPORT = 0.02
 MIN_PMI = 0.8
 MAX_JACCARD = 0.75  # отсекаем почти-дубликаты / копипасту
 MIN_JACCARD = 0.08
+MIN_YEAR_ROLE_VACANCIES = 5
 
 MARKET_EDGE_TYPES = (
     "ROLE_REQUIRES_SKILL",
@@ -54,28 +52,37 @@ MARKET_EDGE_TYPES = (
 MARKET_NODE_TYPES = ("role", "skill", "cluster")
 
 
-def _period(published_at: Optional[datetime]) -> str:
+def _year(published_at: Optional[datetime]) -> Optional[int]:
     if published_at is None:
-        return "unknown"
+        return None
     if published_at.tzinfo is None:
         published_at = published_at.replace(tzinfo=timezone.utc)
-    return "early" if published_at < PERIOD_SPLIT else "late"
+    return published_at.year
 
 
-def load_vacancy_skills(session: Session) -> list[dict[str, Any]]:
-    rows = session.execute(
+def load_vacancy_skills(
+    session: Session,
+    *,
+    sources: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    q = (
         select(
             Vacancy.id,
             Vacancy.role_group,
             Vacancy.published_at,
+            Vacancy.data_source,
             VacancySkill.skill_name,
         ).join(VacancySkill, VacancySkill.vacancy_id == Vacancy.id)
-    ).all()
+    )
+    if sources:
+        q = q.where(Vacancy.data_source.in_(sources))
+    rows = session.execute(q).all()
     return [
         {
             "vacancy_id": r.id,
             "role_group": r.role_group,
             "published_at": r.published_at,
+            "data_source": getattr(r, "data_source", None) or "hh",
             "skill_name": r.skill_name,
         }
         for r in rows
@@ -168,38 +175,98 @@ def build_canonical_mapping(
     return normalizer, canon_id, filtered_vac_skills
 
 
+def _yoy_delta(series: dict[str, float]) -> tuple[float, Optional[int], Optional[int]]:
+    """Δ support между двумя последними годами внутри одного источника."""
+    years = sorted(int(y) for y in series)
+    if len(years) < 2:
+        return 0.0, None, None
+    y0, y1 = years[-2], years[-1]
+    return series[str(y1)] - series[str(y0)], y0, y1
+
+
+def _ols_slope(series: dict[str, float]) -> float:
+    """Наклон support по годам (доля пунктов в год)."""
+    pts = sorted((int(y), float(v)) for y, v in series.items())
+    n = len(pts)
+    if n < 2:
+        return 0.0
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    x_mean = sum(xs) / n
+    y_mean = sum(ys) / n
+    den = sum((x - x_mean) ** 2 for x in xs)
+    if den <= 0:
+        return 0.0
+    return sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / den
+
+
+def _pick_temporal_series(
+    by_source_year: dict[str, dict[str, float]],
+) -> tuple[str, dict[str, float]]:
+    """
+    Серия для графиков: не смешиваем источники.
+    Берём источник, где навык реально встречается; при равенстве — самый длинный ряд.
+    """
+    if not by_source_year:
+        return "none", {}
+    priority = {"kaggle_ai": 3, "hh": 2, "csv_seed": 0}
+
+    alive = {
+        src: series
+        for src, series in by_source_year.items()
+        if any(float(v) > 0 for v in series.values())
+    }
+    pool = alive or by_source_year
+
+    def score(item: tuple[str, dict[str, float]]) -> tuple:
+        src, series = item
+        nonzero = sum(1 for v in series.values() if float(v) > 0)
+        return (nonzero, len(series), priority.get(src, 1), src)
+
+    src, series = max(pool.items(), key=score)
+    return src, series
+
+
 def compute_role_skill_edges(
     raw_rows: list[dict[str, Any]],
     vac_skills: dict[int, set[str]],
     canon_id: dict[str, int],
     normalizer: SkillNormalizer,
 ) -> list[dict[str, Any]]:
-    # vacancy meta
+    """Рёбра role→skill: support + тренд только внутри источника (без смешения корпусов)."""
     vac_meta: dict[int, dict[str, Any]] = {}
     for row in raw_rows:
         vac_meta[row["vacancy_id"]] = {
             "role_group": row["role_group"],
-            "period": _period(row["published_at"]),
+            "year": _year(row["published_at"]),
+            "data_source": row.get("data_source") or "hh",
         }
 
     role_vac_all: dict[str, set[int]] = defaultdict(set)
-    role_vac_period: dict[tuple[str, str], set[int]] = defaultdict(set)
+    role_vac_source: dict[tuple[str, str], set[int]] = defaultdict(set)
+    role_vac_year_source: dict[tuple[str, int, str], set[int]] = defaultdict(set)
     role_skill_all: dict[tuple[str, str], set[int]] = defaultdict(set)
-    role_skill_period: dict[tuple[str, str, str], set[int]] = defaultdict(set)
+    role_skill_source: dict[tuple[str, str, str], set[int]] = defaultdict(set)
+    role_skill_year_source: dict[tuple[str, int, str, str], set[int]] = defaultdict(set)
+    role_sources: dict[str, set[str]] = defaultdict(set)
 
     for vid, skills in vac_skills.items():
         meta = vac_meta.get(vid)
         if not meta:
             continue
         role = meta["role_group"]
-        period = meta["period"]
+        year = meta["year"]
+        source = meta["data_source"]
         role_vac_all[role].add(vid)
-        if period in {"early", "late"}:
-            role_vac_period[(role, period)].add(vid)
+        role_sources[role].add(source)
+        role_vac_source[(role, source)].add(vid)
+        if year is not None:
+            role_vac_year_source[(role, year, source)].add(vid)
         for skill in skills:
             role_skill_all[(role, skill)].add(vid)
-            if period in {"early", "late"}:
-                role_skill_period[(role, period, skill)].add(vid)
+            role_skill_source[(role, source, skill)].add(vid)
+            if year is not None:
+                role_skill_year_source[(role, year, source, skill)].add(vid)
 
     edges: list[dict[str, Any]] = []
     for (role, skill), vids in role_skill_all.items():
@@ -209,24 +276,81 @@ def compute_role_skill_edges(
         count = len(vids)
         if count < MIN_ROLE_SKILL_COUNT:
             continue
-        support = count / n_role
+
+        # support по источникам — берём max, чтобы hh не «тонул» в kaggle
+        support_by_source: dict[str, float] = {}
+        for source in sorted(role_sources.get(role, set())):
+            n_src = len(role_vac_source.get((role, source), set()))
+            if n_src < MIN_ROLE_VACANCIES:
+                continue
+            c_src = len(role_skill_source.get((role, source, skill), set()))
+            support_by_source[source] = round(c_src / n_src, 4)
+
+        support_overall = count / n_role
+        support = max(support_by_source.values()) if support_by_source else support_overall
         if support < MIN_SUPPORT:
             continue
 
-        early_role = len(role_vac_period.get((role, "early"), set()))
-        late_role = len(role_vac_period.get((role, "late"), set()))
-        early_cnt = len(role_skill_period.get((role, "early", skill), set()))
-        late_cnt = len(role_skill_period.get((role, "late", skill), set()))
+        # support по годам — строго внутри источника (иначе csv_seed-2025 vs hh-2026 = ложный обвал)
+        support_by_year_by_source: dict[str, dict[str, float]] = {}
+        for source in sorted(role_sources.get(role, set())):
+            years = sorted(
+                {
+                    y
+                    for (r, y, src) in role_vac_year_source
+                    if r == role and src == source
+                }
+            )
+            series: dict[str, float] = {}
+            for year in years:
+                n_ys = len(role_vac_year_source.get((role, year, source), set()))
+                if n_ys < MIN_YEAR_ROLE_VACANCIES:
+                    continue
+                c_ys = len(role_skill_year_source.get((role, year, source, skill), set()))
+                series[str(year)] = round(c_ys / n_ys, 4)
+            if series:
+                support_by_year_by_source[source] = series
 
-        support_early = (early_cnt / early_role) if early_role >= 5 else None
-        support_late = (late_cnt / late_role) if late_role >= 5 else None
+        trend_by_source: dict[str, float] = {}
+        source_windows: list[tuple[str, int, int, float]] = []
+        for source, series in support_by_year_by_source.items():
+            # csv_seed — один срез; пустые ряды — навык в источнике не встречается
+            if source == "csv_seed" and len(series) < 2:
+                continue
+            if not any(float(v) > 0 for v in series.values()):
+                continue
+            delta, y0, y1 = _yoy_delta(series)
+            if y0 is None or y1 is None:
+                continue
+            trend_by_source[source] = round(delta, 4)
+            source_windows.append((source, y0, y1, delta))
 
-        if support_early is not None and support_late is not None:
-            trend = support_late - support_early
+        trend = 0.0
+        trend_from_year: Optional[int] = None
+        trend_to_year: Optional[int] = None
+        trend_method = "none"
+        if source_windows:
+            # среднее YoY по источникам с ≥2 годами (сопоставимые корпуса)
+            trend = sum(d for *_, d in source_windows) / len(source_windows)
+            # окно берём у самого длинного ряда
+            primary_src, primary_series = _pick_temporal_series(
+                {s: support_by_year_by_source[s] for s, *_ in source_windows if s in support_by_year_by_source}
+            )
+            if len(primary_series) >= 2:
+                _, trend_from_year, trend_to_year = _yoy_delta(primary_series)
+            else:
+                trend_from_year = source_windows[0][1]
+                trend_to_year = source_windows[0][2]
+            trend_method = "mean_within_source_yoy"
         else:
-            trend = 0.0
+            primary_src, primary_series = _pick_temporal_series(support_by_year_by_source)
 
-        # trend_norm: [-1,1] → [0,1]
+        # серия для графиков — один источник, без смешения
+        support_by_year = dict(primary_series)
+        trend_slope = round(_ols_slope(support_by_year), 4) if len(support_by_year) >= 3 else round(trend, 4)
+
+        years_available = sorted(int(y) for y in support_by_year) if support_by_year else []
+
         trend_norm = max(0.0, min(1.0, (trend + 1.0) / 2.0))
         weight = SUPPORT_WEIGHT * support + TREND_WEIGHT * trend_norm
 
@@ -242,11 +366,22 @@ def compute_role_skill_edges(
                     "skill_norm": skill,
                     "skill_name": display,
                     "support": round(support, 4),
+                    "support_overall": round(support_overall, 4),
+                    "support_by_source": support_by_source,
                     "trend": round(trend, 4),
+                    "trend_slope": trend_slope,
+                    "trend_from_year": trend_from_year,
+                    "trend_to_year": trend_to_year,
+                    "trend_method": trend_method,
+                    "trend_by_source": trend_by_source,
+                    "temporal_source": primary_src,
+                    "support_by_year": support_by_year,
+                    "support_by_year_by_source": support_by_year_by_source,
                     "count": count,
                     "role_vacancies": n_role,
-                    "support_early": None if support_early is None else round(support_early, 4),
-                    "support_late": None if support_late is None else round(support_late, 4),
+                    "year_min": years_available[0] if years_available else None,
+                    "year_max": years_available[-1] if years_available else None,
+                    "data_sources": sorted(role_sources.get(role, set())),
                     "canonical_id": canon_id[skill],
                 },
             }
@@ -500,7 +635,6 @@ def persist_graph(
 
 def ensure_schema() -> None:
     Base.metadata.create_all(bind=engine)
-    # миграция лёгкая: колонка vacancy_count могла отсутствовать
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -510,17 +644,54 @@ def ensure_schema() -> None:
                 """
             )
         )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE vacancies
+                ADD COLUMN IF NOT EXISTS data_source VARCHAR(32) DEFAULT 'hh'
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_vacancies_data_source
+                ON vacancies (data_source)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE vacancies SET data_source = 'csv_seed'
+                WHERE search_query LIKE 'seed:%'
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE vacancies SET data_source = 'kaggle_ai'
+                WHERE hh_id LIKE 'kaggle:%' OR search_query LIKE 'kaggle:%'
+                """
+            )
+        )
 
 
-def build_market_graph(*, with_org: bool = True) -> dict[str, Any]:
+def build_market_graph(
+    *,
+    with_org: bool = True,
+    sources: Optional[list[str]] = None,
+) -> dict[str, Any]:
     ensure_schema()
 
     with SessionLocal() as session:
-        raw_rows = load_vacancy_skills(session)
+        raw_rows = load_vacancy_skills(session, sources=sources)
         if not raw_rows:
             raise SystemExit("Нет данных в vacancy_skills — сначала загрузите вакансии.")
 
-        print(f"Сырых связей vacancy↔skill: {len(raw_rows)}")
+        src_note = ",".join(sources) if sources else "all"
+        print(f"Сырых связей vacancy↔skill: {len(raw_rows)} (sources={src_note})")
         normalizer, canon_id, vac_skills = build_canonical_mapping(session, raw_rows)
         print(f"Canonical skills: {len(canon_id)}")
 
@@ -564,6 +735,7 @@ def build_market_graph(*, with_org: bool = True) -> dict[str, Any]:
             .where(GraphEdge.edge_type.in_(MARKET_EDGE_TYPES))
         ) or 0
         stats = {
+            "sources": src_note,
             "raw_links": len(raw_rows),
             "canonical_skills": len(canon_id),
             "roles": len(roles),
@@ -578,7 +750,6 @@ def build_market_graph(*, with_org: bool = True) -> dict[str, Any]:
         print("Market-граф готов:", stats)
 
     if with_org:
-        # canonical ids обновились — пересобираем синтетику и org-слой
         from src.org.build_org_graph import build_org_graph
         from src.org.generate_synthetic import generate_org
 
@@ -596,8 +767,14 @@ def main() -> None:
         action="store_true",
         help="Не пересобирать синтетику/org после market-графа",
     )
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=None,
+        help="Фильтр data_source (можно несколько): hh, csv_seed, kaggle_ai",
+    )
     args = parser.parse_args()
-    build_market_graph(with_org=not args.skip_org)
+    build_market_graph(with_org=not args.skip_org, sources=args.source)
 
 
 if __name__ == "__main__":

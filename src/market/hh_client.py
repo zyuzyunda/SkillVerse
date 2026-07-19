@@ -538,6 +538,7 @@ def normalize_vacancy(raw: dict[str, Any], *, search_query: str, role_group: str
         "alternate_url": raw.get("alternate_url") or f"{HH_SITE}/vacancy/{raw['id']}",
         "search_query": search_query,
         "role_group": role_group,
+        "data_source": "hh",
         "raw_json": raw,
         "key_skills": key_skills,
     }

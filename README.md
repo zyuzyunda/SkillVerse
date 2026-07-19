@@ -130,3 +130,6 @@ docker compose down
 
 Парсер ходит на публичный сайт `hh.ru/search/vacancy` + `hh.ru/vacancy/{id}`
 (HTML + JSON-LD), собирает навыки и описания. Seed CSV остаётся запасным путём.
+
+Дополнительно: Kaggle AI Jobs (2020–2026) → `python -m src.market.seed_from_kaggle_ai`.
+Тренды в графе считаются по годам `published_at` (без меток early/late).

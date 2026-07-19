@@ -199,6 +199,7 @@ def import_csv(
                 "alternate_url": None,
                 "search_query": "seed:final_vacancies",
                 "role_group": role_group,
+                "data_source": "csv_seed",
                 "raw_json": dict(row),
                 "parse_run_id": run.id,
             }

@@ -177,6 +177,7 @@ def import_hh_united(
                 "alternate_url": row.get("url"),
                 "search_query": keyword,
                 "role_group": role_group,
+                "data_source": "csv_seed",
                 "raw_json": dict(row),
                 "parse_run_id": run.id,
             }

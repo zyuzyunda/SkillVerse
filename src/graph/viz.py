@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 from pyvis.network import Network
@@ -241,4 +242,381 @@ def render_subgraph_html(
 ) -> str:
     return _with_sticky_drag(
         subgraph_to_pyvis_html(data, height=height, role_order=role_order)
+    )
+
+
+# Мультивселенная: светлый «созвездие»-холст, навыки окрашены по тренду
+MULTIVERSE_THEME = {
+    "bg": "#EEF2F7",
+    "font": "#0B1220",
+    "skill_up": {
+        "background": "#0D9488",
+        "border": "#115E59",
+        "highlight": {"background": "#2DD4BF", "border": "#0F766E"},
+    },
+    "skill_down": {
+        "background": "#E11D48",
+        "border": "#9F1239",
+        "highlight": {"background": "#FB7185", "border": "#BE123C"},
+    },
+    "skill_flat": {
+        "background": "#64748B",
+        "border": "#334155",
+        "highlight": {"background": "#94A3B8", "border": "#475569"},
+    },
+    "cluster": {
+        "background": "#D97706",
+        "border": "#92400E",
+        "highlight": {"background": "#FBBF24", "border": "#B45309"},
+    },
+    "bridge": {
+        "background": "#2563EB",
+        "border": "#1E40AF",
+        "highlight": {"background": "#60A5FA", "border": "#1D4ED8"},
+    },
+}
+
+
+def _trend_skill_color(node: dict[str, Any]) -> dict[str, Any]:
+    trend = float(node.get("trend") or 0)
+    bridges = int(node.get("bridge_roles") or 1)
+    if bridges >= 3:
+        return MULTIVERSE_THEME["bridge"]
+    if trend >= 0.04:
+        return MULTIVERSE_THEME["skill_up"]
+    if trend <= -0.04:
+        return MULTIVERSE_THEME["skill_down"]
+    return MULTIVERSE_THEME["skill_flat"]
+
+
+def multiverse_to_pyvis_html(
+    data: dict[str, Any],
+    *,
+    height: str = "760px",
+    role_order: Optional[list[str]] = None,
+) -> str:
+    """Граф карьерных вселенных: роли = миры, навыки = пути/мосты, цвет = тренд."""
+    roles = data.get("roles") or role_order or []
+    if isinstance(roles, str):
+        roles = [roles]
+    role_order = list(roles) if roles else role_order
+
+    net = Network(
+        height=height,
+        width="100%",
+        bgcolor=MULTIVERSE_THEME["bg"],
+        font_color=MULTIVERSE_THEME["font"],
+        directed=False,
+        cdn_resources="remote",
+    )
+
+    for node in data.get("nodes", []):
+        ntype = node.get("node_type") or "skill"
+        support = float(node.get("support") or 0)
+        trend = float(node.get("trend") or 0)
+        bridges = int(node.get("bridge_roles") or 1)
+        size = TYPE_SIZES.get(ntype, 16)
+        if ntype == "skill":
+            size = 12 + int(28 * support) + (4 if bridges >= 3 else 0)
+        elif ntype == "role":
+            size = 48
+
+        title_parts = [node.get("label") or node["id"], f"тип: {ntype}"]
+        if ntype == "skill":
+            title_parts.append(f"support: {support:.0%}")
+            title_parts.append(f"тренд: {trend:+.1%}")
+            if bridges > 1:
+                title_parts.append(f"мост между {bridges} ролями")
+        if node.get("cluster"):
+            title_parts.append(f"кластер: {node['cluster']}")
+
+        if ntype == "role":
+            color = _node_color(node, role_order)
+            shape = "box"
+        elif ntype == "cluster":
+            color = MULTIVERSE_THEME["cluster"]
+            shape = "ellipse"
+        else:
+            color = _trend_skill_color(node)
+            shape = "dot"
+
+        net.add_node(
+            node["id"],
+            label=node.get("label") or node["id"],
+            title="<br>".join(title_parts),
+            color=color,
+            size=size,
+            shape=shape,
+            borderWidth=3 if ntype == "role" else (2 if bridges >= 3 else 1),
+            borderWidthSelected=4,
+            font={
+                "size": 15 if ntype == "role" else 12,
+                "face": "IBM Plex Sans, Segoe UI, system-ui, sans-serif",
+                "color": MULTIVERSE_THEME["font"],
+            },
+        )
+
+    for edge in data.get("edges", []):
+        et = edge.get("edge_type") or ""
+        weight = float(edge.get("weight") or edge.get("support") or 0.3)
+        width = 1.2 + 4.0 * min(1.0, weight)
+        if et == "ROLE_REQUIRES_SKILL":
+            ec = {"color": "#64748B", "opacity": 0.5}
+        elif et == "SKILL_CO_OCCURS":
+            ec = {"color": "#94A3B8", "opacity": 0.28}
+        else:
+            ec = EDGE_COLORS.get(et, {"color": "#CBD5E1", "opacity": 0.35})
+        net.add_edge(
+            edge["source"],
+            edge["target"],
+            color={"color": ec["color"], "opacity": ec["opacity"]},
+            width=width,
+            title=et,
+        )
+
+    net.set_options(
+        """
+        {
+          "nodes": {
+            "shadow": {"enabled": true, "size": 8, "x": 0, "y": 3, "color": "rgba(15,23,42,0.14)"}
+          },
+          "edges": {
+            "smooth": {"type": "cubicBezier", "forceDirection": "none", "roundness": 0.45},
+            "selectionWidth": 3
+          },
+          "physics": {
+            "enabled": true,
+            "stabilization": {"enabled": true, "iterations": 180, "fit": true},
+            "barnesHut": {
+              "gravitationalConstant": -22000,
+              "centralGravity": 0.12,
+              "springLength": 170,
+              "springConstant": 0.014,
+              "damping": 0.52,
+              "avoidOverlap": 0.7
+            }
+          },
+          "interaction": {
+            "dragNodes": true,
+            "dragView": true,
+            "zoomView": true,
+            "hover": true,
+            "tooltipDelay": 80,
+            "navigationButtons": true,
+            "keyboard": {"enabled": true}
+          }
+        }
+        """
+    )
+    return net.generate_html(notebook=False)
+
+
+def render_multiverse_html(
+    data: dict[str, Any],
+    *,
+    height: str = "760px",
+    role_order: Optional[list[str]] = None,
+) -> str:
+    return _with_sticky_drag(
+        multiverse_to_pyvis_html(data, height=height, role_order=role_order)
+    )
+
+
+def universes_map_to_pyvis_html(
+    adjacent: list[dict[str, Any]],
+    *,
+    target_role: str,
+    height: str = "560px",
+) -> str:
+    """
+    Карта карьерных вселенных:
+    центр — вы; основная вселенная — главный путь; вокруг — соседние миры.
+    Размер и толщина связи ~ готовность.
+    """
+    net = Network(
+        height=height,
+        width="100%",
+        bgcolor="#F1F5F9",
+        font_color="#0B1220",
+        directed=False,
+        cdn_resources="remote",
+    )
+
+    net.add_node(
+        "you",
+        label="Вы",
+        title="Ваш текущий профиль навыков",
+        color={
+            "background": "#0F172A",
+            "border": "#020617",
+            "highlight": {"background": "#334155", "border": "#0F172A"},
+        },
+        size=42,
+        shape="dot",
+        borderWidth=3,
+        font={"size": 16, "face": "IBM Plex Sans, Segoe UI, system-ui, sans-serif", "color": "#F8FAFC"},
+        x=0,
+        y=0,
+        fixed={"x": True, "y": True},
+    )
+
+    # раскладка по кругу: целевая ближе к центру, остальные дальше при низкой готовности
+    others = [a for a in adjacent if not a.get("is_target") and a.get("role") != target_role]
+    target = next(
+        (a for a in adjacent if a.get("is_target") or a.get("role") == target_role),
+        {"role": target_role, "readiness": 0.0, "covered": 0, "required": 0, "matching_top": [], "missing_top": [], "is_target": True},
+    )
+    nodes_orbit = [target] + others
+
+    n = max(len(nodes_orbit), 1)
+    for i, univ in enumerate(nodes_orbit):
+        role = str(univ.get("role") or "")
+        ready = float(univ.get("readiness") or 0)
+        is_main = bool(univ.get("is_target") or role == target_role)
+        covered = int(univ.get("covered") or 0)
+        required = int(univ.get("required") or 0)
+        matching = univ.get("matching_top") or []
+        missing = univ.get("missing_top") or []
+
+        # радиус: основной путь ближе, слабая готовность — дальше
+        base_r = 180 if is_main else 280
+        radius = base_r + int(140 * (1.0 - ready))
+        angle = (2 * math.pi * i / n) - (math.pi / 2)
+        if is_main:
+            angle = -math.pi / 2  # сверху от «Вы»
+            radius = 160 + int(80 * (1.0 - ready))
+
+        size = 28 + int(36 * ready) if is_main else 18 + int(28 * ready)
+        if is_main:
+            color = {
+                "background": "#0D9488",
+                "border": "#115E59",
+                "highlight": {"background": "#2DD4BF", "border": "#0F766E"},
+            }
+            label = f"★ {role}"
+            path_label = "основной путь"
+        else:
+            # чем выше готовность — тем «теплее» сосед
+            if ready >= 0.45:
+                color = {
+                    "background": "#2563EB",
+                    "border": "#1E40AF",
+                    "highlight": {"background": "#60A5FA", "border": "#1D4ED8"},
+                }
+            elif ready >= 0.25:
+                color = {
+                    "background": "#D97706",
+                    "border": "#92400E",
+                    "highlight": {"background": "#FBBF24", "border": "#B45309"},
+                }
+            else:
+                color = {
+                    "background": "#94A3B8",
+                    "border": "#64748B",
+                    "highlight": {"background": "#CBD5E1", "border": "#475569"},
+                }
+            label = role
+            path_label = "соседняя вселенная"
+
+        title = (
+            f"<b>{role}</b><br>"
+            f"{path_label}<br>"
+            f"готовность: {ready:.0%}<br>"
+            f"закрыто ядро: {covered}/{required}<br>"
+            f"есть: {', '.join(matching[:5]) or '—'}<br>"
+            f"не хватает: {', '.join(missing[:5]) or '—'}"
+        )
+
+        net.add_node(
+            f"univ:{role}",
+            label=label,
+            title=title,
+            color=color,
+            size=size,
+            shape="box" if is_main else "ellipse",
+            borderWidth=4 if is_main else 2,
+            font={
+                "size": 14 if is_main else 12,
+                "face": "IBM Plex Sans, Segoe UI, system-ui, sans-serif",
+                "color": "#0B1220",
+            },
+            x=int(radius * math.cos(angle)),
+            y=int(radius * math.sin(angle)),
+            fixed={"x": False, "y": False},
+        )
+
+        edge_width = 2.5 + 8.0 * ready if is_main else 1.0 + 5.0 * ready
+        edge_color = "#0D9488" if is_main else ("#2563EB" if ready >= 0.35 else "#94A3B8")
+        net.add_edge(
+            "you",
+            f"univ:{role}",
+            title=f"{path_label}: готовность {ready:.0%}",
+            width=edge_width,
+            color={"color": edge_color, "opacity": 0.75 if is_main else 0.45},
+            label=f"{ready:.0%}",
+            font={"size": 11, "color": "#475569", "strokeWidth": 0},
+        )
+
+    # слабые связи между соседними вселенными с похожей готовностью (ощущение мультивселенной)
+    for i, a in enumerate(others):
+        for b in others[i + 1 :]:
+            ra, rb = float(a.get("readiness") or 0), float(b.get("readiness") or 0)
+            if abs(ra - rb) > 0.15:
+                continue
+            overlap = len(set(a.get("matching_top") or []) & set(b.get("matching_top") or []))
+            if overlap < 1 and (ra + rb) < 0.5:
+                continue
+            net.add_edge(
+                f"univ:{a['role']}",
+                f"univ:{b['role']}",
+                width=0.8 + 0.4 * overlap,
+                color={"color": "#CBD5E1", "opacity": 0.35},
+                title=f"близкие миры · общих навыков в профиле: {overlap}",
+            )
+
+    net.set_options(
+        """
+        {
+          "nodes": {
+            "shadow": {"enabled": true, "size": 10, "x": 0, "y": 3, "color": "rgba(15,23,42,0.14)"}
+          },
+          "edges": {
+            "smooth": {"type": "continuous", "roundness": 0.35},
+            "selectionWidth": 2
+          },
+          "physics": {
+            "enabled": true,
+            "stabilization": {"enabled": true, "iterations": 120, "fit": true},
+            "barnesHut": {
+              "gravitationalConstant": -12000,
+              "centralGravity": 0.35,
+              "springLength": 160,
+              "springConstant": 0.02,
+              "damping": 0.55,
+              "avoidOverlap": 0.8
+            }
+          },
+          "interaction": {
+            "dragNodes": true,
+            "dragView": true,
+            "zoomView": true,
+            "hover": true,
+            "tooltipDelay": 60,
+            "navigationButtons": true,
+            "keyboard": {"enabled": true}
+          }
+        }
+        """
+    )
+    return net.generate_html(notebook=False)
+
+
+def render_universes_map_html(
+    adjacent: list[dict[str, Any]],
+    *,
+    target_role: str,
+    height: str = "560px",
+) -> str:
+    return _with_sticky_drag(
+        universes_map_to_pyvis_html(adjacent, target_role=target_role, height=height)
     )

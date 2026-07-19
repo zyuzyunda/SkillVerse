@@ -75,6 +75,8 @@ class Vacancy(Base):
     alternate_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     search_query: Mapped[str] = mapped_column(String(256), nullable=False)
     role_group: Mapped[str] = mapped_column(String(64), nullable=False, default="ml_ai")
+    # hh | csv_seed | kaggle_ai | ...
+    data_source: Mapped[str] = mapped_column(String(32), nullable=False, default="hh")
 
     raw_json: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     parse_run_id: Mapped[Optional[int]] = mapped_column(ForeignKey("parse_runs.id"), nullable=True)
