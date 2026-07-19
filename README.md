@@ -79,9 +79,18 @@ PYTHONPATH=. python -m src.llm.ask --scenario gaps_ds --no-llm
 PYTHONPATH=. python -m src.llm.ask -q "Кого обучить по MLOps?"
 ```
 
-Парсер hh.ru (когда API доступен):
+Парсер hh.ru (HTML-поиск; `api.hh.ru/vacancies` сейчас отдаёт 403):
 
 ```bash
+# тест
+PYTHONPATH=. python -m src.market.parse_hh --limit-per-query 5 --max-pages 2
+
+# полный прогон (Россия, DS/ML/AI)
+PYTHONPATH=. python -m src.market.parse_hh
+
+# только роли
+PYTHONPATH=. python -m src.market.parse_hh --role data_science --role mlops
+
 docker compose --profile parse run --rm parser --limit-per-query 5
 ```
 
@@ -116,5 +125,8 @@ docker compose down
 
 ## Примечание про hh.ru
 
-С некоторых IP `api.hh.ru` отвечает `403` (DDoS-Guard).
-Seed в Postgres закрывает этот этап; живой парсер готов к повторному запуску.
+`api.hh.ru/vacancies` отвечает `403 forbidden` для программных клиентов
+(антибот на edge, не лечится User-Agent/прокси).
+
+Парсер ходит на публичный сайт `hh.ru/search/vacancy` + `hh.ru/vacancy/{id}`
+(HTML + JSON-LD), собирает навыки и описания. Seed CSV остаётся запасным путём.
