@@ -1,7 +1,11 @@
-# AI-платформа управления компетенциями предприятия
+# SkillVerse
 
-Интеллектуальная система анализа компетенций и поддержки кадровых решений
-на основе графа знаний и LLM.
+AI-платформа управления компетенциями: граф знаний рынка DS/ML/AI + LLM-извлечение навыков + HR/career UI (Streamlit).
+
+Репозиторий: [github.com/zyuzyunda/SkillVerse](https://github.com/zyuzyunda/SkillVerse).
+
+**Архитектура (мультиагентная, гибрид LLM + правила):**  
+[docs/architecture_multiagent.md](docs/architecture_multiagent.md)
 
 ## Запуск через Docker (рекомендуется)
 
@@ -12,6 +16,8 @@
 colima start
 
 cd "AI платформа управления компетенциями предприятия"
+# или клон: git clone https://github.com/zyuzyunda/SkillVerse.git
+
 
 # поднять Postgres + инициализация схемы + seed вакансий
 docker compose up --build
@@ -51,7 +57,20 @@ PYTHONPATH=. python -m src.market.seed_from_hh_united
 Сборка market-графа (нормализация → canonical → рёбра с трендом):
 
 ```bash
+# (рекомендуется) LLM-извлечение навыков из description_text hh-вакансий
+# По умолчанию LLM_PROVIDER=auto: Groq → при 403 локальная Ollama (llama3.2:3b)
+# ollama serve && ollama pull llama3.2:3b
+PYTHONPATH=. python -m src.market.extract_skills_llm --source hh --resume
+# только локальная Llama (без VPN); --resume продолжает после Ctrl+C
+# PYTHONPATH=. python -m src.market.extract_skills_llm --provider ollama --resume
+# тест / офлайн-smoke без API:
+# PYTHONPATH=. python -m src.market.extract_skills_llm --limit 5 --provider ollama --no-resume
+# PYTHONPATH=. python -m src.market.extract_skills_llm --limit 20 --mock --no-resume
+
+# граф: key skills + llm_extract → ROLE_REQUIRES_SKILL + SKILL_CO_OCCURS (PMI)
 PYTHONPATH=. python -m src.graph.build_market_graph
+# только РФ:
+# PYTHONPATH=. python -m src.graph.build_market_graph --source hh --source csv_seed --skip-org
 
 docker compose exec db psql -U competence -d competence_platform \
   -c "SELECT edge_type, count(*) FROM graph_edges GROUP BY 1;"
@@ -116,12 +135,17 @@ docker compose down
 - `docker-compose.yml` — Postgres + app (init/seed) + parser
 - `Dockerfile` — образ приложения
 - `data/` — seed рынка (DS/ML/AI)
+- `docs/` — архитектура (мультиагентный пайплайн)
 - `src/db` — модели Postgres
-- `src/market` — парсер hh.ru и seed
+- `src/market` — парсер hh.ru, seed, LLM-извлечение навыков (`extract_skills_llm`)
 - `src/graph` — нормализация навыков и market-граф
 - `src/org` — синтетика сотрудников, org-граф, дефициты, рекомендации
 - `src/llm` — сценарии и ассистент (Groq / fallback)
-- `app_streamlit.py` — HR Dashboard
+- `app_streamlit.py` — HR Dashboard / Мультивселенная / полный граф с фильтрами
+
+Пайплайн навыков (РФ): description → LLM JSON (`llm_extract`, Ollama/Groq) ∪ `hh_key_skills` →
+нормализация → canonical → рёбра `ROLE_REQUIRES_SKILL` и `SKILL_CO_OCCURS` (связки вроде Python–pandas–numpy).
+Подробнее: [docs/architecture_multiagent.md](docs/architecture_multiagent.md).
 
 ## Примечание про hh.ru
 

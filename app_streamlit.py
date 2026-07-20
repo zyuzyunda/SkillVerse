@@ -11,7 +11,13 @@ from sqlalchemy.orm import selectinload
 
 from src.db.models import Department, Employee, EmployeeSkill, GraphEdge, GraphNode
 from src.db.session import SessionLocal
-from src.graph.graph_service import market_subgraph, role_subgraph
+from src.graph.graph_service import (
+    filtered_market_graph,
+    list_market_clusters,
+    list_market_roles,
+    market_subgraph,
+    role_subgraph,
+)
 from src.graph.viz import (
     PLOTLY_DIVERGING,
     PLOTLY_HEAT,
@@ -400,49 +406,197 @@ def page_risks(role: str, dept_code: str | None) -> None:
 
 
 def page_graph(role: str) -> None:
-    st.header("Подграф роли")
+    st.header("Граф компетенций")
     st.caption(
-        "Перетаскивайте узлы мышью · двигайте холст зажатой ЛКМ по фону · "
-        "зуум колёсиком · кнопки навигации справа внизу."
+        "Полный market-граф с фильтрами. "
+        "Перетаскивайте узлы · двигайте холст · зуум колёсиком · навигация справа внизу."
     )
-    c1, c2 = st.columns(2)
-    with c1:
-        top_n = st.slider("Топ навыков", min_value=10, max_value=40, value=20, step=5)
-        min_support = st.slider("Min market support", 0.10, 0.40, 0.15, 0.05)
-    with c2:
-        include_clusters = st.checkbox("Показать кластеры", value=True)
-        include_cooc = st.checkbox("Показать co-occurrence между навыками", value=True)
 
-    data = role_subgraph(
-        role,
-        top_skills=top_n,
-        min_support=min_support,
-        include_clusters=include_clusters,
-        include_cooc=include_cooc,
+    mode = st.radio(
+        "Режим",
+        ["Полный граф рынка", "Подграф роли из сайдбара"],
+        horizontal=True,
+        key="graph_mode",
     )
+
+    all_roles = list_market_roles() or _roles()
+    all_clusters = list_market_clusters()
+
+    if mode == "Полный граф рынка":
+        with st.expander("Фильтры", expanded=True):
+            f1, f2 = st.columns(2)
+            with f1:
+                selected_roles = st.multiselect(
+                    "Роли",
+                    options=all_roles,
+                    default=all_roles,
+                    help="Пустой список = ничего не покажем; по умолчанию все роли",
+                    key="fg_roles",
+                )
+                selected_clusters = st.multiselect(
+                    "Кластеры навыков",
+                    options=all_clusters,
+                    default=[],
+                    help="Пусто = все кластеры. Иначе оставить навыки только из выбранных.",
+                    key="fg_clusters",
+                )
+                skill_query = st.text_input(
+                    "Поиск навыка",
+                    value="",
+                    placeholder="python, rag, docker…",
+                    key="fg_q",
+                )
+            with f2:
+                include_role_skill = st.checkbox("Рёбра роль → навык", value=True, key="fg_rs")
+                include_clusters = st.checkbox("Кластеры", value=True, key="fg_cl")
+                include_cooc = st.checkbox(
+                    "Co-occurrence (навык ↔ навык)",
+                    value=True,
+                    key="fg_cooc",
+                    help="Связи вроде Python–pandas–numpy",
+                )
+
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                min_support = st.slider(
+                    "Min support (роль→навык)",
+                    0.05,
+                    0.50,
+                    0.12,
+                    0.01,
+                    key="fg_sup",
+                )
+            with s2:
+                min_cooc = st.slider(
+                    "Min вес co-occurrence",
+                    0.10,
+                    1.00,
+                    0.40,
+                    0.05,
+                    key="fg_cooc_w",
+                )
+            with s3:
+                top_per_role = st.slider("Топ навыков на роль", 5, 60, 20, 5, key="fg_top")
+
+            lim1, lim2 = st.columns(2)
+            with lim1:
+                max_skills = st.slider("Макс. навыков на графе", 20, 250, 100, 10, key="fg_max_sk")
+            with lim2:
+                max_cooc = st.slider("Макс. co-occurrence рёбер", 10, 200, 60, 10, key="fg_max_co")
+
+        if not selected_roles:
+            st.info("Выберите хотя бы одну роль.")
+            return
+
+        data = filtered_market_graph(
+            roles=selected_roles,
+            clusters=selected_clusters or None,
+            skill_query=skill_query,
+            min_support=min_support,
+            min_cooc_weight=min_cooc,
+            top_skills_per_role=top_per_role,
+            max_skills=max_skills,
+            max_cooc=max_cooc,
+            include_role_skill=include_role_skill,
+            include_clusters=include_clusters,
+            include_cooc=include_cooc,
+        )
+        role_order = selected_roles
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            top_n = st.slider("Топ навыков", min_value=10, max_value=40, value=20, step=5)
+            min_support = st.slider("Min market support", 0.10, 0.40, 0.15, 0.05)
+        with c2:
+            include_clusters = st.checkbox("Показать кластеры", value=True)
+            include_cooc = st.checkbox("Показать co-occurrence между навыками", value=True)
+
+        data = role_subgraph(
+            role,
+            top_skills=top_n,
+            min_support=min_support,
+            include_clusters=include_clusters,
+            include_cooc=include_cooc,
+        )
+        role_order = [role]
+
     if not data["nodes"]:
-        st.warning("Подграф пуст — проверьте роль и пороги.")
+        st.warning("Граф пуст — ослабьте фильтры (support / кластеры / поиск).")
         return
 
-    st.caption(f"Узлов: {data['n_nodes']} · рёбер: {data['n_edges']} · роль: `{role}`")
+    n_roles = sum(1 for n in data["nodes"] if n.get("node_type") == "role")
+    n_skills = sum(1 for n in data["nodes"] if n.get("node_type") == "skill")
+    n_clusters = sum(1 for n in data["nodes"] if n.get("node_type") == "cluster")
+    by_etype: dict[str, int] = {}
+    for e in data["edges"]:
+        t = e.get("edge_type") or "?"
+        by_etype[t] = by_etype.get(t, 0) + 1
 
-    legend = st.columns(3)
-    legend[0].markdown("🟦 **role** — роль (свой цвет)")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Узлов", data["n_nodes"])
+    m2.metric("Рёбер", data["n_edges"])
+    m3.metric("Навыков", n_skills)
+    m4.metric("Ролей / кластеров", f"{n_roles} / {n_clusters}")
+
+    st.caption(
+        " · ".join(f"`{k}`: {v}" for k, v in sorted(by_etype.items()))
+        or "нет рёбер"
+    )
+
+    legend = st.columns(4)
+    legend[0].markdown("🟦 **role** — роль")
     legend[1].markdown("🟧 **cluster** — кластер")
     legend[2].markdown("🟩 **skill** — навык (размер ~ support)")
+    legend[3].markdown("⋯ **серые линии** — co-occurrence")
 
-    html = render_subgraph_html(data, height="680px", role_order=[role])
-    components.html(html, height=700, scrolling=False)
-
-    skills = [n for n in data["nodes"] if n["node_type"] == "skill"]
-    if skills:
-        with st.expander("Таблица навыков на графе"):
-            sdf = (
-                pd.DataFrame(skills)[["label", "cluster", "support"]]
-                .rename(columns={"label": "skill"})
-                .sort_values("support", ascending=False)
+    if len(role_order) > 1:
+        legend_cols = st.columns(min(len(role_order), 5))
+        for i, r in enumerate(role_order):
+            color = role_color(r, role_order)
+            legend_cols[i % len(legend_cols)].markdown(
+                f"<span style='display:inline-block;width:10px;height:10px;"
+                f"border-radius:3px;background:{color};margin-right:6px'></span>"
+                f"**{r}**",
+                unsafe_allow_html=True,
             )
+
+    html = render_subgraph_html(data, height="720px", role_order=role_order)
+    components.html(html, height=740, scrolling=False)
+
+    skills = [n for n in data["nodes"] if n.get("node_type") == "skill"]
+    if skills:
+        with st.expander("Таблица навыков на графе", expanded=False):
+            rows = []
+            for n in skills:
+                rows.append(
+                    {
+                        "skill": n.get("label"),
+                        "cluster": n.get("cluster"),
+                        "support": n.get("support"),
+                        "roles": ", ".join(n.get("roles") or []),
+                    }
+                )
+            sdf = pd.DataFrame(rows).sort_values("support", ascending=False)
             st.dataframe(sdf, use_container_width=True, hide_index=True)
+
+    cooc_edges = [e for e in data["edges"] if e.get("edge_type") == "SKILL_CO_OCCURS"]
+    if cooc_edges:
+        with st.expander("Связи навыков (SKILL_CO_OCCURS)", expanded=False):
+            id_to_label = {n["id"]: n.get("label") or n["id"] for n in data["nodes"]}
+            crow = []
+            for e in cooc_edges:
+                crow.append(
+                    {
+                        "skill_a": id_to_label.get(e["source"], e["source"]),
+                        "skill_b": id_to_label.get(e["target"], e["target"]),
+                        "weight": e.get("weight"),
+                        "cond_prob": e.get("cond_prob"),
+                        "pmi": e.get("pmi"),
+                        "count": e.get("count"),
+                    }
+                )
+            cdf = pd.DataFrame(crow).sort_values("weight", ascending=False)
+            st.dataframe(cdf, use_container_width=True, hide_index=True)
 
 
 def page_market_pulse(role: str) -> None:

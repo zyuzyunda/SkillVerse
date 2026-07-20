@@ -34,14 +34,21 @@ TREND_WEIGHT = 0.3
 MIN_ROLE_VACANCIES = 5
 MIN_SKILL_VACANCIES = 3
 MIN_ROLE_SKILL_COUNT = 2
-MIN_COOC_COUNT = 15
-MIN_SKILL_FOR_COOC = 20
-TOP_COOC_PER_SKILL = 8
+# пороги под более плотный корпус (key skills + llm_extract)
+MIN_COOC_COUNT = 8
+MIN_SKILL_FOR_COOC = 12
+TOP_COOC_PER_SKILL = 12
 MIN_SUPPORT = 0.02
 MIN_PMI = 0.8
+# частые hub-навыки (Python) дают низкий PMI — берём условную вероятность
+MIN_COND_PROB = 0.45  # max(P(a|b), P(b|a))
 MAX_JACCARD = 0.75  # отсекаем почти-дубликаты / копипасту
 MIN_JACCARD = 0.08
 MIN_YEAR_ROLE_VACANCIES = 5
+
+# llm_optional («будет плюсом») не идёт в support/тренды/cooc — шум
+EXCLUDED_SKILL_SOURCES = frozenset({"llm_optional"})
+EXCLUDED_SKILL_NAMES = frozenset({"__llm_done__"})
 
 MARKET_EDGE_TYPES = (
     "ROLE_REQUIRES_SKILL",
@@ -65,6 +72,11 @@ def load_vacancy_skills(
     *,
     sources: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
+    """Загружает vacancy↔skill для графа.
+
+    Включает hh_key_skills, llm_extract и seed-источники.
+    Исключает llm_optional (желательные навыки).
+    """
     q = (
         select(
             Vacancy.id,
@@ -72,7 +84,12 @@ def load_vacancy_skills(
             Vacancy.published_at,
             Vacancy.data_source,
             VacancySkill.skill_name,
+            VacancySkill.source,
         ).join(VacancySkill, VacancySkill.vacancy_id == Vacancy.id)
+        .where(
+            VacancySkill.source.notin_(EXCLUDED_SKILL_SOURCES),
+            VacancySkill.skill_name.notin_(EXCLUDED_SKILL_NAMES),
+        )
     )
     if sources:
         q = q.where(Vacancy.data_source.in_(sources))
@@ -84,6 +101,7 @@ def load_vacancy_skills(
             "published_at": r.published_at,
             "data_source": getattr(r, "data_source", None) or "hh",
             "skill_name": r.skill_name,
+            "skill_source": r.source,
         }
         for r in rows
     ]
@@ -419,7 +437,7 @@ def compute_cooccurrence_edges(
         if n_vac < 20:
             return []
 
-        candidates: list[tuple[float, str, str, int, float, float]] = []
+        candidates: list[tuple[float, str, str, int, float, float, float]] = []
         for (a, b), cnt in pair_count.items():
             if cnt < MIN_COOC_COUNT:
                 continue
@@ -436,16 +454,17 @@ def compute_cooccurrence_edges(
             if p_a <= 0 or p_b <= 0 or p_ab <= 0:
                 continue
             pmi = log2(p_ab / (p_a * p_b))
-            if pmi < MIN_PMI:
+            cond = max(cnt / skill_count[a], cnt / skill_count[b])
+            # PMI ловит редкие связки; cond — стеки вокруг hub (Python→pandas/numpy)
+            if pmi < MIN_PMI and cond < MIN_COND_PROB:
                 continue
-            # score для ранжирования: PMI * log(count)
-            score = pmi * log2(1 + cnt)
-            candidates.append((score, a, b, cnt, jaccard, pmi))
+            score = (pmi * log2(1 + cnt)) if pmi >= MIN_PMI else (cond * log2(1 + cnt))
+            candidates.append((score, a, b, cnt, jaccard, pmi, cond))
 
         candidates.sort(reverse=True)
         degree: Counter[str] = Counter()
         edges: list[dict[str, Any]] = []
-        for score, a, b, cnt, jaccard, pmi in candidates:
+        for score, a, b, cnt, jaccard, pmi, cond in candidates:
             if degree[a] >= TOP_COOC_PER_SKILL or degree[b] >= TOP_COOC_PER_SKILL:
                 continue
             degree[a] += 1
@@ -454,6 +473,7 @@ def compute_cooccurrence_edges(
                 "count": cnt,
                 "jaccard": round(jaccard, 4),
                 "pmi": round(pmi, 4),
+                "cond_prob": round(cond, 4),
                 "skill_a": normalizer._canonicals.get(a, a),
                 "skill_b": normalizer._canonicals.get(b, b),
                 "canonical_id_a": canon_id[a],
@@ -461,12 +481,13 @@ def compute_cooccurrence_edges(
             }
             if role_label:
                 props["role_group"] = role_label
+            weight = round(float(pmi), 4) if pmi >= MIN_PMI else round(float(cond), 4)
             edges.append(
                 {
                     "source_key": f"skill:{a}",
                     "target_key": f"skill:{b}",
                     "edge_type": "SKILL_CO_OCCURS",
-                    "weight": round(float(pmi), 4),
+                    "weight": weight,
                     "properties": props,
                 }
             )

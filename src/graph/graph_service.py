@@ -240,3 +240,260 @@ def market_subgraph(
         "n_nodes": len(merged_nodes),
         "n_edges": len(merged_edges),
     }
+
+
+def list_market_roles() -> list[str]:
+    g = load_networkx(edge_types=["ROLE_REQUIRES_SKILL"])
+    roles = sorted(
+        n.replace("role:", "", 1)
+        for n, d in g.nodes(data=True)
+        if d.get("node_type") == "role" and str(n).startswith("role:")
+    )
+    return roles
+
+
+def list_market_clusters() -> list[str]:
+    g = load_networkx(edge_types=["CLUSTER_CONTAINS_SKILL"])
+    return sorted(
+        str(d.get("label") or n.replace("cluster:", "", 1))
+        for n, d in g.nodes(data=True)
+        if d.get("node_type") == "cluster"
+    )
+
+
+def filtered_market_graph(
+    *,
+    roles: Optional[list[str]] = None,
+    clusters: Optional[list[str]] = None,
+    skill_query: str = "",
+    min_support: float = 0.10,
+    min_cooc_weight: float = 0.3,
+    top_skills_per_role: int = 25,
+    max_skills: int = 120,
+    max_cooc: int = 80,
+    include_role_skill: bool = True,
+    include_clusters: bool = True,
+    include_cooc: bool = True,
+) -> dict[str, Any]:
+    """Полный market-граф с фильтрами для UI.
+
+    Берёт все роли (или выбранные), топ навыков по support, опционально
+    кластеры и co-occurrence. Режет размер через max_skills / max_cooc.
+    """
+    edge_types = []
+    if include_role_skill:
+        edge_types.append("ROLE_REQUIRES_SKILL")
+    if include_clusters:
+        edge_types.extend(["ROLE_REQUIRES_CLUSTER", "CLUSTER_CONTAINS_SKILL"])
+    if include_cooc:
+        edge_types.append("SKILL_CO_OCCURS")
+    if not edge_types:
+        return {"roles": [], "nodes": [], "edges": [], "n_nodes": 0, "n_edges": 0}
+
+    g = load_networkx(edge_types=edge_types)
+    all_roles = [
+        n.replace("role:", "", 1)
+        for n, d in g.nodes(data=True)
+        if d.get("node_type") == "role" and str(n).startswith("role:")
+    ]
+    selected_roles = [r for r in (roles or all_roles) if r in all_roles]
+    if not selected_roles:
+        return {"roles": [], "nodes": [], "edges": [], "n_nodes": 0, "n_edges": 0}
+
+    q = (skill_query or "").strip().lower()
+    cluster_filter = {c.lower() for c in (clusters or []) if c}
+
+    # skill → best support across selected roles
+    skill_best: dict[str, float] = {}
+    skill_roles: dict[str, set[str]] = {}
+    role_skill_edges: list[tuple[str, str, float, dict[str, Any]]] = []
+
+    for role in selected_roles:
+        role_key = f"role:{role}"
+        if role_key not in g:
+            continue
+        scored: list[tuple[str, float, dict[str, Any]]] = []
+        for _, tgt, data in g.edges(role_key, data=True):
+            if data.get("edge_type") != "ROLE_REQUIRES_SKILL":
+                continue
+            support = float(data.get("support") or data.get("weight") or 0)
+            if support < min_support:
+                continue
+            nd = g.nodes[tgt]
+            label = str(nd.get("label") or tgt)
+            cluster_name = str(nd.get("cluster") or "")
+            if q and q not in label.lower() and q not in tgt.lower():
+                continue
+            if cluster_filter and cluster_name.lower() not in cluster_filter:
+                continue
+            scored.append((tgt, support, data))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        for sk, support, data in scored[:top_skills_per_role]:
+            role_skill_edges.append((role_key, sk, support, data))
+            skill_best[sk] = max(skill_best.get(sk, 0.0), support)
+            skill_roles.setdefault(sk, set()).add(role)
+
+    # если нет ROLE_REQUIRES_SKILL (фильтр выключен) — берём навыки из кластеров/cooc
+    if not include_role_skill and (include_clusters or include_cooc):
+        for n, d in g.nodes(data=True):
+            if d.get("node_type") != "skill":
+                continue
+            label = str(d.get("label") or n)
+            cluster_name = str(d.get("cluster") or "")
+            if q and q not in label.lower() and q not in str(n).lower():
+                continue
+            if cluster_filter and cluster_name.lower() not in cluster_filter:
+                continue
+            skill_best[n] = float(d.get("vacancy_count") or d.get("support") or 1.0)
+
+    keep_skills = {
+        sk
+        for sk, _ in sorted(skill_best.items(), key=lambda x: x[1], reverse=True)[
+            : max(1, max_skills)
+        ]
+    }
+
+    keep_clusters: set[str] = set()
+    if include_clusters and keep_skills:
+        for n, d in g.nodes(data=True):
+            if d.get("node_type") != "cluster":
+                continue
+            label = str(d.get("label") or n)
+            if cluster_filter and label.lower() not in cluster_filter:
+                continue
+            # кластер связан хотя бы с одним keep skill
+            linked = False
+            for _, sk, data in g.edges(n, data=True):
+                if data.get("edge_type") == "CLUSTER_CONTAINS_SKILL" and sk in keep_skills:
+                    linked = True
+                    break
+            if linked or (cluster_filter and label.lower() in cluster_filter):
+                keep_clusters.add(n)
+
+    sub = nx.Graph()
+    for role in selected_roles:
+        role_key = f"role:{role}"
+        if role_key in g:
+            nd = dict(g.nodes[role_key])
+            nd["role_group"] = role
+            sub.add_node(role_key, **nd)
+
+    for sk in keep_skills:
+        if sk not in g:
+            continue
+        nd = dict(g.nodes[sk])
+        nd["support"] = skill_best.get(sk, float(nd.get("support") or 0))
+        sub.add_node(sk, **nd)
+
+    for ckey in keep_clusters:
+        if ckey in g:
+            sub.add_node(ckey, **g.nodes[ckey])
+
+    # рёбра role→skill
+    for role_key, sk, support, data in role_skill_edges:
+        if sk not in keep_skills or role_key not in sub:
+            continue
+        ed = dict(data)
+        ed["support"] = support
+        if not sub.has_edge(role_key, sk):
+            sub.add_edge(role_key, sk, **ed)
+
+    # кластеры
+    if include_clusters:
+        for role in selected_roles:
+            role_key = f"role:{role}"
+            if role_key not in sub:
+                continue
+            for _, ckey, data in g.edges(role_key, data=True):
+                if data.get("edge_type") != "ROLE_REQUIRES_CLUSTER":
+                    continue
+                if ckey not in keep_clusters:
+                    continue
+                if not sub.has_edge(role_key, ckey):
+                    sub.add_edge(role_key, ckey, **data)
+        for ckey in keep_clusters:
+            for _, sk, data in g.edges(ckey, data=True):
+                if data.get("edge_type") != "CLUSTER_CONTAINS_SKILL":
+                    continue
+                if sk not in keep_skills:
+                    continue
+                if not sub.has_edge(ckey, sk):
+                    sub.add_edge(ckey, sk, **data)
+
+    # co-occurrence
+    if include_cooc and keep_skills:
+        cooc: list[tuple[str, str, float, dict[str, Any]]] = []
+        for u, v, data in g.edges(data=True):
+            if data.get("edge_type") != "SKILL_CO_OCCURS":
+                continue
+            if u not in keep_skills or v not in keep_skills:
+                continue
+            w = float(data.get("weight") or 0)
+            cond = float(data.get("cond_prob") or 0)
+            score = max(w, cond)
+            if score < min_cooc_weight:
+                continue
+            cooc.append((u, v, score, data))
+        cooc.sort(key=lambda x: x[2], reverse=True)
+        for u, v, _, data in cooc[:max_cooc]:
+            if not sub.has_edge(u, v):
+                sub.add_edge(u, v, **data)
+
+    # убрать изолированные skills без рёбер (кроме случая только skills)
+    if include_role_skill or include_clusters or include_cooc:
+        isolates = [
+            n
+            for n in list(sub.nodes())
+            if sub.degree(n) == 0 and sub.nodes[n].get("node_type") == "skill"
+        ]
+        sub.remove_nodes_from(isolates)
+
+    n_nodes = max(sub.number_of_nodes(), 1)
+    pos = nx.spring_layout(
+        sub,
+        seed=42,
+        k=1.4 / max(n_nodes**0.5, 1),
+        iterations=60,
+    )
+
+    nodes_out = []
+    for key, data in sub.nodes(data=True):
+        x, y = pos.get(key, (0.0, 0.0))
+        ntype = data.get("node_type")
+        item: dict[str, Any] = {
+            "id": key,
+            "label": data.get("label") or key,
+            "node_type": ntype,
+            "cluster": data.get("cluster"),
+            "x": float(x),
+            "y": float(y),
+            "support": float(data.get("support") or 0),
+        }
+        if ntype == "role":
+            item["role_group"] = data.get("role_group") or key.replace("role:", "", 1)
+        if ntype == "skill" and key in skill_roles:
+            item["roles"] = sorted(skill_roles[key])
+        nodes_out.append(item)
+
+    edges_out = []
+    for u, v, data in sub.edges(data=True):
+        edges_out.append(
+            {
+                "source": u,
+                "target": v,
+                "edge_type": data.get("edge_type"),
+                "weight": float(data.get("weight") or 0),
+                "support": float(data.get("support") or 0),
+                "cond_prob": float(data.get("cond_prob") or 0),
+                "pmi": float(data.get("pmi") or 0),
+                "count": int(data.get("count") or 0),
+            }
+        )
+
+    return {
+        "roles": selected_roles,
+        "nodes": nodes_out,
+        "edges": edges_out,
+        "n_nodes": len(nodes_out),
+        "n_edges": len(edges_out),
+    }

@@ -25,6 +25,14 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
     llm_model: str = "llama-3.3-70b-versatile"
+    # auto | groq | ollama | openai — auto: Groq → при 403 локальная Ollama
+    llm_provider: str = "auto"
+    # OpenAI-compatible (OpenRouter и т.п.)
+    llm_api_key: str = ""
+    llm_base_url: str = ""
+    # локальная Llama через Ollama (без VPN)
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_model: str = "llama3.2:3b"
 
 
 settings = Settings()
