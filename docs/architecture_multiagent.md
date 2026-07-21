@@ -131,12 +131,12 @@ sequenceDiagram
 | Роль | Статус | Где в коде |
 |---|---|---|
 | 1. Parser | реализован | `src/market/parse_hh.py`, `hh_client.py` |
-| 2. Section Splitter | частично / TODO | сейчас целиком `description_text`; вырезка секций — следующий шаг |
-| 3. Skill Extractor | реализован | `src/market/extract_skills_llm.py` (Ollama / Groq) |
+| 2. Section Splitter | **реализован (rules → LLM на fallback_full)** · ветка `feature/pipeline-block1` | `src/market/split_sections.py` → `section_*`; CLI `--llm-fallback --only-fallback`; QA: Streamlit «Блок 1 · Секции» |
+| 3. Skill Extractor | **реализован** · читает секции Block 1 | `src/market/extract_skills_llm.py` (`--from-sections`, Ollama / Groq) |
 | 4. Relation Builder | реализован | `src/graph/build_market_graph.py` (`ROLE_REQUIRES_SKILL`, `SKILL_CO_OCCURS`) |
-| 5. SAA | реализован (правила) | `src/graph/normalize.py` (`SkillNormalizer`) |
-| 6. CRA | частично | фильтры шума / редкости в normalizer + пороги cooc |
-| 7. Evaluator | частично | пороги `MIN_*` при persist графа; отдельный judge-агент — TODO |
+| 5. SAA | реализован (правила + журнал fuzzy) | `src/graph/normalize.py` + `kg_quarantine` |
+| 6. CRA | **реализован (правила + карантин)** | `src/graph/governance.py` — noise/stoplist/optional/cooc filters |
+| 7. Evaluator | **реализован (policy thresholds + журнал)** | пороги `MIN_*` в `build_market_graph`; QA: Streamlit «Блок 3 · Governance» |
 
 Ежедневный парсер (cron) — в планах; сейчас работаем с загруженным корпусом
 (hh + csv_seed + kaggle_ai).
@@ -144,11 +144,19 @@ sequenceDiagram
 ### Запуск текущего пайплайна
 
 ```bash
-# извлечение навыков (локальная Llama через Ollama при недоступности Groq)
-PYTHONPATH=. python -m src.market.extract_skills_llm --provider ollama --resume
+# блок 1: секции (rules); LLM только на слабые fallback_full
+PYTHONPATH=. python -m src.market.split_sections --source hh
+PYTHONPATH=. python -m src.market.split_sections --source hh --only-fallback --llm-fallback --provider ollama
 
-# чистка + связи + граф
+# извлечение навыков из kept-секций (после split)
+# если llm_extract уже был с полного description — перезаписать: --no-resume
+PYTHONPATH=. python -m src.market.extract_skills_llm --provider ollama --from-sections --require-sections
+# smoke:
+# PYTHONPATH=. python -m src.market.extract_skills_llm --provider ollama --from-sections --no-resume --limit 5
+
+# чистка + связи + граф (+ журнал карантина блок 3)
 PYTHONPATH=. python -m src.graph.build_market_graph --source hh --skip-org
+# UI: «Блок 3 · Governance»
 
 # UI
 PYTHONPATH=. streamlit run app_streamlit.py

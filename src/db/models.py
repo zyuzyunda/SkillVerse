@@ -51,6 +51,12 @@ class Vacancy(Base):
     description_html: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     description_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Блок 1: вырезанные секции (обязанности / требования / отброшенное)
+    section_responsibilities: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    section_requirements: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    section_discarded: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    section_meta: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+
     employer_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     employer_name: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
@@ -153,6 +159,28 @@ class GraphNode(Base):
     properties: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class KgQuarantine(Base):
+    """Блок 3 · CRA/Evaluator: отбракованные или принятые с пометкой решения."""
+
+    __tablename__ = "kg_quarantine"
+    __table_args__ = (
+        Index("ix_kg_quarantine_agent", "agent"),
+        Index("ix_kg_quarantine_reason", "reason"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agent: Mapped[str] = mapped_column(String(32), nullable=False)  # saa|cra|evaluator
+    decision: Mapped[str] = mapped_column(String(16), nullable=False, default="reject")
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    item_type: Mapped[str] = mapped_column(String(32), nullable=False)  # skill|edge|summary
+    item_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    sources: Mapped[str] = mapped_column(String(64), nullable=False, default="hh")
+    built_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
 
 

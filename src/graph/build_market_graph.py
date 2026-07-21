@@ -25,6 +25,12 @@ from src.db.models import (
 )
 from src.db.session import Base, SessionLocal, engine
 from src.graph.clusters import assign_cluster, cluster_code
+from src.graph.governance import (
+    GovernanceLedger,
+    count_optional_excluded,
+    ensure_quarantine_table,
+    reject_reason_for_raw,
+)
 from src.graph.normalize import SkillNormalizer, normalize_text
 
 SUPPORT_WEIGHT = 0.7
@@ -108,7 +114,10 @@ def load_vacancy_skills(
 
 
 def build_canonical_mapping(
-    session: Session, raw_rows: list[dict[str, Any]]
+    session: Session,
+    raw_rows: list[dict[str, Any]],
+    *,
+    ledger: Optional[GovernanceLedger] = None,
 ) -> tuple[SkillNormalizer, dict[str, int], dict[int, set[str]]]:
     """
     Returns:
@@ -123,12 +132,44 @@ def build_canonical_mapping(
 
     # сначала частые навыки → стабильнее fuzzy
     resolved: dict[str, tuple[str, str, str]] = {}  # raw → (display, norm, method)
-    for raw, _ in raw_freq.most_common():
+    for raw, freq in raw_freq.most_common():
+        early = reject_reason_for_raw(raw)
+        if early:
+            if ledger:
+                ledger.add(
+                    agent="cra",
+                    reason=early,
+                    item_type="skill",
+                    item_key=raw.strip()[:200],
+                    detail={"freq": freq},
+                )
+            continue
         result = normalizer.resolve(raw)
         if result is None:
+            if ledger:
+                ledger.add(
+                    agent="saa",
+                    reason="unresolved",
+                    item_type="skill",
+                    item_key=raw.strip()[:200],
+                    detail={"freq": freq},
+                )
             continue
         resolved[raw] = (result.canonical_name, result.name_norm, result.match_method)
         normalizer.register_raw_as_alias(raw, result.name_norm)
+        if ledger and result.match_method == "fuzzy":
+            ledger.add(
+                agent="saa",
+                reason="fuzzy_align",
+                item_type="skill",
+                item_key=raw.strip()[:200],
+                decision="accept",
+                detail={
+                    "canonical": result.canonical_name,
+                    "method": result.match_method,
+                    "freq": freq,
+                },
+            )
 
     # очистка старых справочников (org-skills ссылаются на canonical — снимаем сначала)
     session.execute(delete(EmployeeSkill))
@@ -152,7 +193,16 @@ def build_canonical_mapping(
     for c_norm, display in normalizer._canonicals.items():
         if c_norm not in vac_by_canon:
             continue
-        if len(vac_by_canon[c_norm]) < MIN_SKILL_VACANCIES:
+        n_vac = len(vac_by_canon[c_norm])
+        if n_vac < MIN_SKILL_VACANCIES:
+            if ledger:
+                ledger.add(
+                    agent="evaluator",
+                    reason="rare_skill",
+                    item_type="skill",
+                    item_key=display,
+                    detail={"vacancy_count": n_vac, "min": MIN_SKILL_VACANCIES},
+                )
             continue
         cluster = assign_cluster(c_norm, display)
         obj = SkillCanonical(
@@ -160,7 +210,7 @@ def build_canonical_mapping(
             name_norm=c_norm,
             skill_type="skill",
             cluster_name=cluster,
-            vacancy_count=len(vac_by_canon[c_norm]),
+            vacancy_count=n_vac,
             metadata_json={"cluster_code": cluster_code(cluster)},
         )
         session.add(obj)
@@ -250,6 +300,8 @@ def compute_role_skill_edges(
     vac_skills: dict[int, set[str]],
     canon_id: dict[str, int],
     normalizer: SkillNormalizer,
+    *,
+    ledger: Optional[GovernanceLedger] = None,
 ) -> list[dict[str, Any]]:
     """Рёбра role→skill: support + тренд только внутри источника (без смешения корпусов)."""
     vac_meta: dict[int, dict[str, Any]] = {}
@@ -287,12 +339,17 @@ def compute_role_skill_edges(
                 role_skill_year_source[(role, year, source, skill)].add(vid)
 
     edges: list[dict[str, Any]] = []
+    rej_role_small = 0
+    rej_count = 0
+    rej_support = 0
     for (role, skill), vids in role_skill_all.items():
         n_role = len(role_vac_all[role])
         if n_role < MIN_ROLE_VACANCIES:
+            rej_role_small += 1
             continue
         count = len(vids)
         if count < MIN_ROLE_SKILL_COUNT:
+            rej_count += 1
             continue
 
         # support по источникам — берём max, чтобы hh не «тонул» в kaggle
@@ -307,6 +364,7 @@ def compute_role_skill_edges(
         support_overall = count / n_role
         support = max(support_by_source.values()) if support_by_source else support_overall
         if support < MIN_SUPPORT:
+            rej_support += 1
             continue
 
         # support по годам — строго внутри источника (иначе csv_seed-2025 vs hh-2026 = ложный обвал)
@@ -404,6 +462,16 @@ def compute_role_skill_edges(
                 },
             }
         )
+    if ledger:
+        ledger.add_summary(
+            agent="evaluator", reason="role_too_small", count=rej_role_small
+        )
+        ledger.add_summary(
+            agent="evaluator", reason="role_skill_low_count", count=rej_count
+        )
+        ledger.add_summary(
+            agent="evaluator", reason="role_skill_low_support", count=rej_support
+        )
     return edges
 
 
@@ -413,8 +481,10 @@ def compute_cooccurrence_edges(
     normalizer: SkillNormalizer,
     *,
     role_by_vac: Optional[dict[int, str]] = None,
+    ledger: Optional[GovernanceLedger] = None,
 ) -> list[dict[str, Any]]:
     """Co-occurrence на PMI + фильтры шума; опционально внутри role_group."""
+    rej = Counter()
 
     def build_for_subset(subset: dict[int, set[str]], role_label: str | None) -> list[dict[str, Any]]:
         pair_count: Counter[tuple[str, str]] = Counter()
@@ -440,12 +510,15 @@ def compute_cooccurrence_edges(
         candidates: list[tuple[float, str, str, int, float, float, float]] = []
         for (a, b), cnt in pair_count.items():
             if cnt < MIN_COOC_COUNT:
+                rej["cooc_low_count"] += 1
                 continue
             if skill_count[a] < MIN_SKILL_FOR_COOC or skill_count[b] < MIN_SKILL_FOR_COOC:
+                rej["cooc_skill_rare"] += 1
                 continue
             union = skill_count[a] + skill_count[b] - cnt
             jaccard = cnt / union if union else 0.0
             if jaccard < MIN_JACCARD or jaccard > MAX_JACCARD:
+                rej["cooc_jaccard"] += 1
                 continue
             # PMI = log2( P(a,b) / (P(a)P(b)) )
             p_ab = cnt / n_vac
@@ -457,6 +530,7 @@ def compute_cooccurrence_edges(
             cond = max(cnt / skill_count[a], cnt / skill_count[b])
             # PMI ловит редкие связки; cond — стеки вокруг hub (Python→pandas/numpy)
             if pmi < MIN_PMI and cond < MIN_COND_PROB:
+                rej["cooc_weak_assoc"] += 1
                 continue
             score = (pmi * log2(1 + cnt)) if pmi >= MIN_PMI else (cond * log2(1 + cnt))
             candidates.append((score, a, b, cnt, jaccard, pmi, cond))
@@ -466,6 +540,7 @@ def compute_cooccurrence_edges(
         edges: list[dict[str, Any]] = []
         for score, a, b, cnt, jaccard, pmi, cond in candidates:
             if degree[a] >= TOP_COOC_PER_SKILL or degree[b] >= TOP_COOC_PER_SKILL:
+                rej["cooc_degree_cap"] += 1
                 continue
             degree[a] += 1
             degree[b] += 1
@@ -507,9 +582,14 @@ def compute_cooccurrence_edges(
                 prev = best.get(key)
                 if prev is None or float(e["weight"]) > float(prev["weight"]):
                     best[key] = e
-        return list(best.values())
+        out = list(best.values())
+    else:
+        out = build_for_subset(vac_skills, None)
 
-    return build_for_subset(vac_skills, None)
+    if ledger:
+        for reason, count in rej.items():
+            ledger.add_summary(agent="cra", reason=reason, count=count)
+    return out
 
 
 def compute_cluster_edges(
@@ -656,6 +736,7 @@ def persist_graph(
 
 def ensure_schema() -> None:
     Base.metadata.create_all(bind=engine)
+    ensure_quarantine_table()
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -705,22 +786,35 @@ def build_market_graph(
     sources: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     ensure_schema()
+    src_note = ",".join(sources) if sources else "all"
+    ledger = GovernanceLedger(sources=src_note)
 
     with SessionLocal() as session:
         raw_rows = load_vacancy_skills(session, sources=sources)
         if not raw_rows:
             raise SystemExit("Нет данных в vacancy_skills — сначала загрузите вакансии.")
 
-        src_note = ",".join(sources) if sources else "all"
+        optional_n = count_optional_excluded(session, sources=sources)
+        ledger.add_summary(
+            agent="cra",
+            reason="llm_optional_excluded",
+            count=optional_n,
+            note="желательные навыки не входят в support/cooc",
+        )
+
         print(f"Сырых связей vacancy↔skill: {len(raw_rows)} (sources={src_note})")
-        normalizer, canon_id, vac_skills = build_canonical_mapping(session, raw_rows)
+        normalizer, canon_id, vac_skills = build_canonical_mapping(
+            session, raw_rows, ledger=ledger
+        )
         print(f"Canonical skills: {len(canon_id)}")
 
         roles = {r["role_group"] for r in raw_rows}
         role_by_vac = {r["vacancy_id"]: r["role_group"] for r in raw_rows}
-        role_edges = compute_role_skill_edges(raw_rows, vac_skills, canon_id, normalizer)
+        role_edges = compute_role_skill_edges(
+            raw_rows, vac_skills, canon_id, normalizer, ledger=ledger
+        )
         cooc_edges = compute_cooccurrence_edges(
-            vac_skills, canon_id, normalizer, role_by_vac=role_by_vac
+            vac_skills, canon_id, normalizer, role_by_vac=role_by_vac, ledger=ledger
         )
         cluster_by_skill = {
             c_norm: assign_cluster(c_norm, normalizer._canonicals.get(c_norm, c_norm))
@@ -743,6 +837,7 @@ def build_market_graph(
             edges=role_edges + cooc_edges + contain_edges + role_cluster_edges,
             cluster_by_skill=cluster_by_skill,
         )
+        n_q = ledger.persist(session)
         session.commit()
 
         n_nodes = session.scalar(
@@ -767,8 +862,11 @@ def build_market_graph(
             "role_cluster_edges": len(role_cluster_edges),
             "market_nodes": n_nodes,
             "market_edges": n_edges,
+            "quarantine_rows": n_q,
+            "governance": dict(ledger.counts),
         }
         print("Market-граф готов:", stats)
+        print(f"Governance (блок 3) карантин: {n_q} строк")
 
     if with_org:
         from src.org.build_org_graph import build_org_graph

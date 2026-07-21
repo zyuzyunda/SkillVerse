@@ -1,4 +1,7 @@
-"""LLM-извлечение навыков из description_text вакансий (промпт по мотивам helper).
+"""LLM-извлечение навыков из вакансий (промпт по мотивам helper).
+
+По умолчанию читает kept-секции (обязанности + требования) после Block 1;
+если секций нет — fallback на description_text.
 
 Пишет в vacancy_skills:
   - source=llm_extract  (required)
@@ -264,12 +267,20 @@ def _is_timeout(exc: BaseException) -> bool:
     return "timed out" in msg or "timeout" in msg or "read timed out" in msg
 
 
-def _chat_ollama(messages: list[dict[str, str]], *, temperature: float) -> str:
+def _chat_ollama(
+    messages: list[dict[str, str]],
+    *,
+    temperature: float,
+    timeout_sec: Optional[int] = None,
+    num_predict: Optional[int] = None,
+) -> str:
     """Локальная Llama: native /api/chat + format=json (стабильнее, чем /v1)."""
     import requests
 
     base = (settings.ollama_base_url or "http://127.0.0.1:11434").rstrip("/")
     model = settings.ollama_model or "llama3.2:3b"
+    read_timeout = int(timeout_sec) if timeout_sec else OLLAMA_TIMEOUT_SEC
+    predict = int(num_predict) if num_predict else OLLAMA_NUM_PREDICT
     resp = requests.post(
         f"{base}/api/chat",
         json={
@@ -280,11 +291,11 @@ def _chat_ollama(messages: list[dict[str, str]], *, temperature: float) -> str:
             "keep_alive": "5m",
             "options": {
                 "temperature": temperature,
-                "num_predict": OLLAMA_NUM_PREDICT,
+                "num_predict": predict,
                 "num_ctx": OLLAMA_NUM_CTX,
             },
         },
-        timeout=(5, OLLAMA_TIMEOUT_SEC),  # connect, read
+        timeout=(5, read_timeout),  # connect, read
     )
     if resp.status_code >= 400:
         raise RuntimeError(
@@ -300,6 +311,8 @@ def _chat_completion(
     *,
     temperature: float = 0,
     provider: Optional[str] = None,
+    timeout_sec: Optional[int] = None,
+    num_predict: Optional[int] = None,
 ) -> str:
     """
     Провайдеры:
@@ -332,7 +345,12 @@ def _chat_completion(
         )
 
     if mode == "ollama":
-        return _chat_ollama(messages, temperature=temperature)
+        return _chat_ollama(
+            messages,
+            temperature=temperature,
+            timeout_sec=timeout_sec,
+            num_predict=num_predict,
+        )
 
     if mode == "groq":
         return _chat_groq(messages, temperature=temperature)
@@ -346,11 +364,21 @@ def _chat_completion(
                     "Groq Forbidden (403) — переключаюсь на локальную Ollama "
                     f"({settings.ollama_model})…"
                 )
-                return _chat_ollama(messages, temperature=temperature)
+                return _chat_ollama(
+                    messages,
+                    temperature=temperature,
+                    timeout_sec=timeout_sec,
+                    num_predict=num_predict,
+                )
             raise
 
     print(f"GROQ_API_KEY пуст — использую Ollama ({settings.ollama_model})")
-    return _chat_ollama(messages, temperature=temperature)
+    return _chat_ollama(
+        messages,
+        temperature=temperature,
+        timeout_sec=timeout_sec,
+        num_predict=num_predict,
+    )
 
 
 def mock_extract_skills(title: str, description: str) -> dict[str, list[str]]:
@@ -497,6 +525,24 @@ def _replace_llm_skills(
     )
 
 
+def text_for_extract(vacancy: Vacancy, *, from_sections: bool = True) -> tuple[str, str]:
+    """Текст для LLM: секции Block 1, иначе полный description.
+
+    Returns:
+        (text, source) где source ∈ {"sections", "description"}.
+    """
+    if from_sections and (
+        vacancy.section_responsibilities or vacancy.section_requirements
+    ):
+        from src.market.split_sections import kept_text
+
+        kept = kept_text(vacancy).strip()
+        if len(kept) >= MIN_DESC_LEN:
+            return kept, "sections"
+    desc = (vacancy.description_text or "").strip()
+    return desc, "description"
+
+
 def iter_candidate_vacancies(
     session: Session,
     *,
@@ -504,6 +550,7 @@ def iter_candidate_vacancies(
     limit: Optional[int],
     offset: int,
     resume: bool,
+    require_sections: bool = False,
 ) -> list[Vacancy]:
     q = (
         select(Vacancy)
@@ -515,6 +562,11 @@ def iter_candidate_vacancies(
         .order_by(Vacancy.id)
         .offset(offset)
     )
+    if require_sections:
+        q = q.where(
+            (Vacancy.section_responsibilities.is_not(None))
+            | (Vacancy.section_requirements.is_not(None))
+        )
     if limit is not None:
         q = q.limit(limit)
     vacancies = list(session.scalars(q).all())
@@ -534,6 +586,8 @@ def run_extraction(
     mock: bool = False,
     provider: Optional[str] = None,
     sleep_sec: float = DEFAULT_SLEEP_SEC,
+    from_sections: bool = True,
+    require_sections: bool = False,
 ) -> dict[str, int]:
     ensure_schema()
     resolved_provider = (provider or settings.llm_provider or "auto").strip().lower()
@@ -544,6 +598,8 @@ def run_extraction(
         "errors": 0,
         "skills_required": 0,
         "skills_optional": 0,
+        "from_sections": 0,
+        "from_description": 0,
         "mode": "mock" if mock else resolved_provider,
     }
 
@@ -554,10 +610,14 @@ def run_extraction(
             limit=limit,
             offset=offset,
             resume=resume,
+            require_sections=require_sections,
         )
         stats["candidates"] = len(vacancies)
         if not vacancies:
-            print("Нет вакансий для LLM-извлечения (проверьте description_text / --resume).")
+            print(
+                "Нет вакансий для LLM-извлечения "
+                "(проверьте description_text / секции / --resume)."
+            )
             return stats
 
         if not dry_run and not mock:
@@ -567,14 +627,21 @@ def run_extraction(
                 )
 
         for vacancy in tqdm(vacancies, desc=f"LLM extract [{data_source}]"):
-            desc = (vacancy.description_text or "").strip()
+            desc, text_source = text_for_extract(vacancy, from_sections=from_sections)
             if len(desc) < MIN_DESC_LEN:
                 stats["skipped_empty"] += 1
                 continue
 
             if dry_run:
-                print(f"[dry-run] id={vacancy.id} hh_id={vacancy.hh_id} title={vacancy.name[:60]!r}")
+                print(
+                    f"[dry-run] id={vacancy.id} via={text_source} "
+                    f"chars={len(desc)} title={(vacancy.name or '')[:50]!r}"
+                )
                 stats["processed"] += 1
+                if text_source == "sections":
+                    stats["from_sections"] += 1
+                else:
+                    stats["from_description"] += 1
                 continue
 
             try:
@@ -592,6 +659,10 @@ def run_extraction(
             required = extracted["skills_required"]
             optional = extracted["skills_optional"]
             _replace_llm_skills(session, vacancy, required, optional)
+            if text_source == "sections":
+                stats["from_sections"] += 1
+            else:
+                stats["from_description"] += 1
             session.commit()
 
             stats["processed"] += 1
@@ -640,6 +711,17 @@ def main() -> None:
         default=DEFAULT_SLEEP_SEC,
         help="Пауза между запросами (сек)",
     )
+    parser.add_argument(
+        "--from-sections",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Текст из responsibilities+requirements (Block 1); иначе полный description (default: true)",
+    )
+    parser.add_argument(
+        "--require-sections",
+        action="store_true",
+        help="Только вакансии, у которых уже есть section_*",
+    )
     args = parser.parse_args()
     run_extraction(
         data_source=args.source,
@@ -650,6 +732,8 @@ def main() -> None:
         mock=args.mock,
         provider=args.provider,
         sleep_sec=args.sleep,
+        from_sections=args.from_sections,
+        require_sections=args.require_sections,
     )
 
 

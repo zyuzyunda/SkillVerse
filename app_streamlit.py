@@ -1086,6 +1086,341 @@ def page_assistant(role: str, dept_code: str | None) -> None:
         st.warning("Введите вопрос.")
 
 
+def page_block1_sections(role: str) -> None:
+    """Блок 1 пайплайна: статус корпуса + контроль качества вырезки секций."""
+    from sqlalchemy import func, select
+
+    from src.db.models import Vacancy
+    from src.db.session import SessionLocal
+    from src.market.split_sections import (
+        apply_split_to_vacancy,
+        corpus_section_stats,
+        ensure_section_columns,
+        kept_text,
+        run_split,
+        split_description_hybrid,
+    )
+
+    st.header("Блок 1 · Ingest & секции")
+    st.caption(
+        "Агент 1 — корпус вакансий (парсер уже загрузил). "
+        "Агент 2 — вырезка обязанностей/требований (правила → LLM на fallback). "
+        "Дальше (агент 3): "
+        "`PYTHONPATH=. python -m src.market.extract_skills_llm "
+        "--provider ollama --from-sections --require-sections --no-resume`"
+    )
+
+    ensure_section_columns()
+    data_source = st.selectbox(
+        "Источник",
+        ["hh", "csv_seed", "kaggle_ai"],
+        index=0,
+        key="b1_src",
+    )
+
+    with SessionLocal() as session:
+        # --- corpus pulse (agent 1) ---
+        src_rows = session.execute(
+            select(Vacancy.data_source, func.count())
+            .group_by(Vacancy.data_source)
+            .order_by(func.count().desc())
+        ).all()
+        st.subheader("Агент 1 · корпус")
+        ccols = st.columns(min(len(src_rows) or 1, 4))
+        for i, (src, n) in enumerate(src_rows):
+            ccols[i % len(ccols)].metric(str(src), int(n))
+        st.caption(
+            "Ежедневный cron-парсер — позже. Сейчас: "
+            "`PYTHONPATH=. python -m src.market.parse_hh`"
+        )
+
+        stats = corpus_section_stats(session, data_source=data_source)
+        st.subheader("Агент 2 · секции")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("С описанием", stats["with_description"])
+        k2.metric("Уже разрезано", stats["split_done"])
+        k3.metric("Avg kept_ratio", f"{stats['avg_kept_ratio']:.0%}")
+        rules_n = int(stats["by_method"].get("rules", 0))
+        fb_n = int(stats["by_method"].get("fallback_full", 0))
+        llm_n = int(stats["by_method"].get("llm", 0))
+        k4.metric("rules / fallback / llm", f"{rules_n} / {fb_n} / {llm_n}")
+
+        with st.expander("Методы split", expanded=False):
+            st.json(stats["by_method"])
+
+        # --- batch controls ---
+        st.divider()
+        b1, b2, b3, b4 = st.columns([1, 1, 1, 2])
+        with b1:
+            batch_limit = st.number_input("Батч limit", min_value=1, max_value=1000, value=50, step=10)
+        with b2:
+            force = st.checkbox("Перезаписать (--no-resume)", value=False)
+        with b3:
+            llm_fb = st.checkbox(
+                "LLM на fallback",
+                value=False,
+                help="Только для method=fallback_full (слабые). Нужен Ollama/Groq.",
+                key="b1_llm_fb",
+            )
+            only_fb = st.checkbox(
+                "Только fallback_full",
+                value=False,
+                help="Прогнать LLM только по слабым",
+                key="b1_only_fb",
+            )
+        with b4:
+            st.write("")
+            st.write("")
+            if st.button("Прогнать батч split", type="primary", key="b1_batch"):
+                with st.spinner("Режем секции…" + (" + LLM fallback" if llm_fb else "")):
+                    out = run_split(
+                        data_source=data_source,
+                        limit=int(batch_limit) if not only_fb else None,
+                        resume=not force and not only_fb,
+                        llm_fallback=llm_fb,
+                        only_fallback=only_fb,
+                        provider="ollama" if llm_fb else None,
+                    )
+                st.success(f"Готово: {out}")
+                st.rerun()
+
+        # --- filters for review ---
+        st.divider()
+        st.subheader("Контроль качества")
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            role_opts = ["(все)"] + sorted(
+                {
+                    r
+                    for (r,) in session.execute(
+                        select(Vacancy.role_group)
+                        .where(Vacancy.data_source == data_source)
+                        .distinct()
+                    ).all()
+                    if r
+                }
+            )
+            default_idx = role_opts.index(role) if role in role_opts else 0
+            role_f = st.selectbox("Роль", role_opts, index=default_idx, key="b1_role")
+        with f2:
+            quality = st.selectbox(
+                "Срез качества",
+                [
+                    "Все разрезанные",
+                    "Только rules",
+                    "Только fallback_full (слабые)",
+                    "Только llm",
+                    "Ещё не разрезаны",
+                ],
+                key="b1_q",
+            )
+        with f3:
+            q = st.text_input("Поиск в title", value="", key="b1_search")
+
+        qv = (
+            select(Vacancy)
+            .where(
+                Vacancy.data_source == data_source,
+                Vacancy.description_text.is_not(None),
+                func.length(Vacancy.description_text) >= 50,
+            )
+            .order_by(Vacancy.id)
+        )
+        if role_f != "(все)":
+            qv = qv.where(Vacancy.role_group == role_f)
+        if q.strip():
+            qv = qv.where(Vacancy.name.ilike(f"%{q.strip()}%"))
+
+        vacs = list(session.scalars(qv.limit(500)).all())
+
+        def _method(v: Vacancy) -> str:
+            return str((v.section_meta or {}).get("method") or "")
+
+        if quality == "Только rules":
+            vacs = [v for v in vacs if _method(v) == "rules"]
+        elif quality == "Только fallback_full (слабые)":
+            vacs = [v for v in vacs if _method(v) == "fallback_full"]
+        elif quality == "Только llm":
+            vacs = [v for v in vacs if _method(v) == "llm"]
+        elif quality == "Ещё не разрезаны":
+            vacs = [v for v in vacs if not _method(v)]
+        else:
+            vacs = [v for v in vacs if _method(v)]
+
+        if not vacs:
+            st.info("Нет вакансий под фильтр. Прогони батч или ослабь срез.")
+            return
+
+        labels = {
+            v.id: f"#{v.id} · {v.role_group} · {(v.name or '')[:70]}"
+            for v in vacs
+        }
+        chosen_id = st.selectbox(
+            f"Вакансия ({len(vacs)})",
+            options=list(labels.keys()),
+            format_func=lambda i: labels[i],
+            key="b1_vac",
+        )
+        vac = next(v for v in vacs if v.id == chosen_id)
+
+        c_a, c_b = st.columns([3, 1])
+        with c_a:
+            st.markdown(f"**{vac.name}**")
+            st.caption(
+                f"{vac.employer_name or '—'} · {vac.area_name or '—'} · "
+                f"`{vac.role_group}` · published {vac.published_at}"
+            )
+            if vac.alternate_url:
+                st.markdown(f"[Открыть на hh]({vac.alternate_url})")
+        with c_b:
+            use_llm_one = st.checkbox("LLM если fallback", value=True, key="b1_one_llm")
+            if st.button("Пересобрать эту", key="b1_one"):
+                result = split_description_hybrid(
+                    vac.description_text or "",
+                    title=vac.name or "",
+                    llm_fallback=use_llm_one,
+                    provider="ollama",
+                )
+                apply_split_to_vacancy(vac, result)
+                session.commit()
+                st.success(f"method={result.method}, kept={result.kept_ratio:.0%}")
+                st.rerun()
+
+        meta = vac.section_meta or {}
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("method", meta.get("method") or "—")
+        m2.metric("kept_ratio", f"{float(meta.get('kept_ratio') or 0):.0%}")
+        lengths = meta.get("lengths") or {}
+        m3.metric("keep chars", int(lengths.get("responsibilities", 0)) + int(lengths.get("requirements", 0)))
+        m4.metric("discard chars", int(lengths.get("discarded", 0)))
+        headers = meta.get("headers_found") or []
+        if headers:
+            st.caption("Заголовки: " + ", ".join(f"{h.get('kind')}:{h.get('header')}" for h in headers[:12]))
+
+        col_src, col_keep, col_drop = st.columns(3)
+        with col_src:
+            st.markdown("**Исходный текст**")
+            st.text_area(
+                "description_text",
+                value=vac.description_text or "",
+                height=420,
+                disabled=True,
+                label_visibility="collapsed",
+                key=f"b1_src_{vac.id}",
+            )
+        with col_keep:
+            st.markdown("**Keep · обязанности + требования**")
+            keep_body = kept_text(vac) if meta.get("method") else "(ещё не разрезано)"
+            # show split explicitly
+            resp = vac.section_responsibilities or ""
+            req = vac.section_requirements or ""
+            pretty = ""
+            if resp:
+                pretty += f"### Обязанности\n{resp}\n\n"
+            if req:
+                pretty += f"### Требования\n{req}"
+            if not pretty:
+                pretty = keep_body
+            st.text_area(
+                "keep",
+                value=pretty.strip() or "(пусто)",
+                height=420,
+                disabled=True,
+                label_visibility="collapsed",
+                key=f"b1_keep_{vac.id}",
+            )
+        with col_drop:
+            st.markdown("**Отброшено** (о компании / условия)")
+            st.text_area(
+                "discarded",
+                value=vac.section_discarded or "(пусто)",
+                height=420,
+                disabled=True,
+                label_visibility="collapsed",
+                key=f"b1_drop_{vac.id}",
+            )
+
+
+def page_block3_governance(_role: str) -> None:
+    """Блок 3: SAA / CRA / Evaluator — журнал карантина."""
+    from src.db.models import GraphEdge, GraphNode, KgQuarantine, SkillCanonical
+    from src.graph.governance import corpus_governance_stats, ensure_quarantine_table
+
+    st.header("Блок 3 · KG Governance")
+    st.caption(
+        "Агенты 5–7: Schema Alignment → Conflict Resolution → Evaluator. "
+        "Журнал заполняется при `build_market_graph`."
+    )
+    ensure_quarantine_table()
+    sources = st.selectbox("Корпус", ["hh", "csv_seed", "kaggle_ai", "all"], index=0, key="b3_src")
+
+    with SessionLocal() as session:
+        stats = corpus_governance_stats(session, sources=sources)
+        n_canon = session.scalar(select(func.count()).select_from(SkillCanonical)) or 0
+        n_nodes = session.scalar(
+            select(func.count()).select_from(GraphNode).where(GraphNode.node_type == "skill")
+        ) or 0
+        n_edges = session.scalar(select(func.count()).select_from(GraphEdge)) or 0
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Canonical skills", int(n_canon))
+        k2.metric("Skill nodes", int(n_nodes))
+        k3.metric("Все рёбра графа", int(n_edges))
+        k4.metric("Карантин (detail)", stats["detail_rows"])
+        st.caption(f"Последняя сборка governance: {stats['built_at'] or '— (прогоните build_market_graph)'}")
+
+        if stats["summaries"]:
+            st.subheader("Сводки отбраковки")
+            st.dataframe(
+                [
+                    {
+                        "agent": s["agent"],
+                        "reason": s["reason"],
+                        "count": s["count"],
+                    }
+                    for s in stats["summaries"]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.subheader("Примеры решений")
+        agent_f = st.selectbox(
+            "Агент",
+            ["все", "saa", "cra", "evaluator"],
+            key="b3_agent",
+        )
+        q = (
+            select(KgQuarantine)
+            .where(
+                KgQuarantine.sources == sources,
+                KgQuarantine.item_type != "summary",
+            )
+            .order_by(KgQuarantine.id.desc())
+            .limit(80)
+        )
+        if agent_f != "все":
+            q = q.where(KgQuarantine.agent == agent_f)
+        items = list(session.scalars(q).all())
+        if not items:
+            st.info("Карантин пуст — пересоберите граф: `PYTHONPATH=. python -m src.graph.build_market_graph --source hh --skip-org`")
+            return
+        st.dataframe(
+            [
+                {
+                    "agent": it.agent,
+                    "decision": it.decision,
+                    "reason": it.reason,
+                    "item": it.item_key,
+                    "detail": it.detail,
+                }
+                for it in items
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def page_career_multiverse(role: str) -> None:
     """Обзорный дашборд рынка: Россия (hh) / Мир (Kaggle)."""
     st.markdown(
@@ -2132,6 +2467,8 @@ def main() -> None:
         page = st.radio(
             "Раздел",
             [
+                "Блок 1 · Секции",
+                "Блок 3 · Governance",
                 "Мультивселенная",
                 "Моя вселенная",
                 "Обзор",
@@ -2146,7 +2483,11 @@ def main() -> None:
             ],
         )
 
-    if page == "Мультивселенная":
+    if page == "Блок 1 · Секции":
+        page_block1_sections(role)
+    elif page == "Блок 3 · Governance":
+        page_block3_governance(role)
+    elif page == "Мультивселенная":
         page_career_multiverse(role)
     elif page == "Моя вселенная":
         page_my_universe(role)

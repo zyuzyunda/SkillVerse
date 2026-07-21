@@ -7,6 +7,14 @@ AI-платформа управления компетенциями: граф 
 **Архитектура (мультиагентная, гибрид LLM + правила):**  
 [docs/architecture_multiagent.md](docs/architecture_multiagent.md)
 
+Новый пайплайн (Блок 1 · секции) разрабатывается в ветке `feature/pipeline-block1`:
+```bash
+git checkout feature/pipeline-block1
+PYTHONPATH=. python -m src.market.split_sections --source hh --resume
+PYTHONPATH=. streamlit run app_streamlit.py
+# раздел «Блок 1 · Секции»
+```
+
 ## Запуск через Docker (рекомендуется)
 
 Используется **Colima** + Docker CLI (без Docker Desktop).
