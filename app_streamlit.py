@@ -16,6 +16,8 @@ from src.graph.graph_service import (
     list_market_clusters,
     list_market_roles,
     market_subgraph,
+    personal_profile_subgraph,
+    pipeline_kg_stats,
     role_subgraph,
 )
 from src.graph.viz import (
@@ -1449,11 +1451,23 @@ def page_career_multiverse(role: str) -> None:
           <h1>Мультивселенная · обзор рынка</h1>
           <p>
             Спады и рост навыков, редкие и уникальные компетенции,
-            география и компании — в одном интерактивном срезе.
+            география и компании — плюс market-KG из пайплайна
+            (секции → extract → governance): спрос роли и co-occurrence стеков.
           </p>
         </div>
         """,
         unsafe_allow_html=True,
+    )
+
+    kg = pipeline_kg_stats()
+    gk1, gk2, gk3, gk4 = st.columns(4)
+    gk1.metric("Canonical skills", kg["canonical_skills"])
+    gk2.metric("ROLE → skill", kg["role_skill_edges"])
+    gk3.metric("SKILL ↔ SKILL (cooc)", kg["cooc_edges"])
+    gk4.metric("Governance summaries", kg["quarantine_summaries"])
+    st.caption(
+        "Граф собран новым подходом: секции вакансий → LLM-extract → "
+        "SAA/CRA/Evaluator. Ниже — аналитика корпуса; в конце — интерактивный KG."
     )
 
     mode_label = st.radio(
@@ -1961,38 +1975,48 @@ def page_career_multiverse(role: str) -> None:
 
     st.divider()
 
-    # —— GRAPH ——
-    with st.expander("Карта вселенных (граф ролей и навыков)", expanded=False):
-        st.caption(
-            "Исследовательский слой: роли и топ-навыки. "
-            "Бирюзовый ≈ растёт, розовый ≈ падает, синий ≈ мост."
+    # —— GRAPH (market KG from new pipeline) ——
+    st.subheader("Market-KG · карта вселенных")
+    st.caption(
+        "Рёбра `ROLE_REQUIRES_SKILL` и `SKILL_CO_OCCURS` (PMI / cond_prob) "
+        "после governance. Бирюзовый ≈ растёт, розовый ≈ падает, синий ≈ мост между ролями. "
+        "Включите co-occurrence, чтобы увидеть стеки вроде Python–pandas–numpy."
+    )
+    graph_roles = role_opts or list(pulse["by_role"].keys())[:4]
+    if not graph_roles:
+        st.info("Нет ролей для графа.")
+    else:
+        gcol1, gcol2, gcol3, gcol4 = st.columns(4)
+        with gcol1:
+            top_n = st.slider("Топ навыков / роль", 8, 28, 14, 2, key="mv_g_top")
+        with gcol2:
+            min_sup = st.slider("Min support", 0.08, 0.35, 0.12, 0.01, key="mv_g_sup")
+        with gcol3:
+            show_cooc = st.checkbox("Co-occurrence стеков", value=True, key="mv_g_cooc")
+        with gcol4:
+            show_clusters = st.checkbox("Кластеры", value=True, key="mv_g_cl")
+        data = market_subgraph(
+            graph_roles,
+            top_skills=top_n,
+            min_support=min_sup,
+            include_clusters=show_clusters,
+            include_cooc=show_cooc,
+            top_cooc=36,
         )
-        graph_roles = role_opts or list(pulse["by_role"].keys())[:4]
-        if not graph_roles:
-            st.info("Нет ролей для графа.")
+        with SessionLocal() as session:
+            rows = load_market_skills(session, role_group=None, min_support=0.08)
+        data = annotate_graph_trends(data, rows)
+        n_co = sum(1 for e in data.get("edges", []) if e.get("edge_type") == "SKILL_CO_OCCURS")
+        n_rs = sum(1 for e in data.get("edges", []) if e.get("edge_type") == "ROLE_REQUIRES_SKILL")
+        st.caption(
+            f"Подграф: {data.get('n_nodes', 0)} узлов · "
+            f"{n_rs} role→skill · {n_co} cooc · роли: {', '.join(graph_roles)}"
+        )
+        if data["nodes"]:
+            html = render_multiverse_html(data, height="680px", role_order=graph_roles)
+            components.html(html, height=700, scrolling=False)
         else:
-            gcol1, gcol2, gcol3 = st.columns(3)
-            with gcol1:
-                top_n = st.slider("Топ навыков / роль", 8, 24, 12, 2, key="mv_g_top")
-            with gcol2:
-                min_sup = st.slider("Min support", 0.08, 0.35, 0.15, 0.01, key="mv_g_sup")
-            with gcol3:
-                show_cooc = st.checkbox("Co-occurrence", value=False, key="mv_g_cooc")
-            data = market_subgraph(
-                graph_roles,
-                top_skills=top_n,
-                min_support=min_sup,
-                include_clusters=True,
-                include_cooc=show_cooc,
-            )
-            with SessionLocal() as session:
-                rows = load_market_skills(session, role_group=None, min_support=0.08)
-            data = annotate_graph_trends(data, rows)
-            if data["nodes"]:
-                html = render_multiverse_html(data, height="640px", role_order=graph_roles)
-                components.html(html, height=660, scrolling=False)
-            else:
-                st.warning("Подграф пуст — снизьте порог support.")
+            st.warning("Подграф пуст — снизьте порог support или выберите другие роли.")
 
 
 def page_my_universe(default_role: str) -> None:
@@ -2033,11 +2057,18 @@ def page_my_universe(default_role: str) -> None:
           <h1>Моя профессиональная вселенная</h1>
           <p>
             Выберите роль-вселенную, укажите навыки, которые уже есть —
-            получите готовность к рынку, пробелы и путь развития.
+            получите готовность к рынку, пробелы и путь развития
+            на market-KG (секции → extract → governance).
           </p>
         </div>
         """,
         unsafe_allow_html=True,
+    )
+
+    kg = pipeline_kg_stats()
+    st.caption(
+        f"KG: {kg['canonical_skills']} canonical · "
+        f"{kg['role_skill_edges']} role→skill · {kg['cooc_edges']} cooc"
     )
 
     roles = _roles()
@@ -2159,11 +2190,49 @@ def page_my_universe(default_role: str) -> None:
     else:
         st.info("Недостаточно данных по ролям для карты.")
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Маршрут обучения", "Что уже есть", "Соседние вселенные", "Курсы"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Граф профиля (KG)", "Маршрут обучения", "Что уже есть", "Соседние вселенные", "Курсы"]
     )
 
     with tab1:
+        st.markdown("##### Ваш срез market-KG")
+        st.caption(
+            "Зелёный — уже есть · розовый — пробел в ядре роли · серый — сосед по co-occurrence. "
+            "Рёбра: спрос роли (`ROLE_REQUIRES_SKILL`) и стеки (`SKILL_CO_OCCURS`)."
+        )
+        g1, g2 = st.columns(2)
+        with g1:
+            show_cooc_mu = st.checkbox("Показать co-occurrence", value=True, key="mu_g_cooc")
+        with g2:
+            expand_nbr = st.checkbox(
+                "Соседи стека вокруг моих навыков",
+                value=True,
+                key="mu_g_nbr",
+                help="Подтянуть навыки, часто встречающиеся вместе с вашими (Python→pandas…)",
+            )
+        data = personal_profile_subgraph(
+            target,
+            have_skills=[h["skill"] for h in path["have"]],
+            gap_skills=[g["skill"] for g in path["learning_path"][:16]],
+            min_support=min_sup,
+            top_skills=28,
+            include_clusters=True,
+            include_cooc=show_cooc_mu,
+            expand_cooc_neighbors=expand_nbr,
+        )
+        n_have = sum(1 for n in data.get("nodes", []) if n.get("status") == "have")
+        n_gap = sum(1 for n in data.get("nodes", []) if n.get("status") == "gap")
+        n_co = sum(1 for e in data.get("edges", []) if e.get("edge_type") == "SKILL_CO_OCCURS")
+        st.caption(
+            f"{data.get('n_nodes', 0)} узлов · есть {n_have} · пробелы {n_gap} · cooc-рёбер {n_co}"
+        )
+        if data.get("nodes"):
+            html = render_multiverse_html(data, height="640px", role_order=[target])
+            components.html(html, height=660, scrolling=False)
+        else:
+            st.warning("Подграф пуст — снизьте порог спроса или выберите другую роль.")
+
+    with tab2:
         steps = path.get("learning_steps") or []
         if not steps:
             st.info("Критичных пробелов нет — усиливайте соседние вселенные или трендовые навыки.")
@@ -2298,7 +2367,7 @@ def page_my_universe(default_role: str) -> None:
                         hide_index=True,
                     )
 
-    with tab2:
+    with tab3:
         c_have, c_bonus = st.columns(2)
         with c_have:
             st.markdown("**Покрывают целевую вселенную**")
@@ -2326,7 +2395,7 @@ def page_my_universe(default_role: str) -> None:
             else:
                 st.caption("Все ваши навыки внутри выбранной вселенной — отлично.")
 
-    with tab3:
+    with tab4:
         if not adj:
             st.info("Нет данных по ролям.")
         else:
@@ -2348,7 +2417,7 @@ def page_my_universe(default_role: str) -> None:
                 "без полного переобучения."
             )
 
-    with tab4:
+    with tab5:
         courses = path["courses"]
         if not courses:
             st.info("Нет курсов, закрывающих ваши пробелы. Смотрите путь обучения вручную.")
@@ -2367,72 +2436,6 @@ def page_my_universe(default_role: str) -> None:
                 use_container_width=True,
                 hide_index=True,
             )
-
-    st.divider()
-    st.subheader("Карта вашего пути")
-    st.caption(
-        "Целевая роль + ваши навыки + топ-пробелы. "
-        "Зелёные акценты на графиках выше — то, что уже есть; путь обучения — что добрать."
-    )
-
-    # мини-граф: роль + have + learning gaps
-    focus_skills = [h["skill"] for h in path["have"][:10]] + [
-        g["skill"] for g in path["learning_path"][:10]
-    ]
-    data = role_subgraph(
-        target,
-        top_skills=22,
-        min_support=min_sup,
-        include_clusters=True,
-        include_cooc=False,
-    )
-    # подсветим статусы в title через annotate + properties
-    have_set = {h["skill"].lower() for h in path["have"]}
-    gap_set = {g["skill"].lower() for g in path["learning_path"]}
-    nodes = []
-    for n in data.get("nodes", []):
-        nn = dict(n)
-        if nn.get("node_type") == "skill":
-            label = (nn.get("label") or "").lower()
-            if label in have_set:
-                nn["trend"] = 0.2
-                nn["bridge_roles"] = 1
-            elif label in gap_set:
-                nn["trend"] = -0.2
-                nn["bridge_roles"] = 1
-            else:
-                nn["trend"] = 0.0
-        nodes.append(nn)
-    data = dict(data)
-    data["nodes"] = nodes
-    # фильтр: оставим роль, кластеры и навыки из focus / top
-    if focus_skills:
-        keep_labels = {s.lower() for s in focus_skills}
-        keep_ids = {"role:" + target}
-        for n in data["nodes"]:
-            if n.get("node_type") == "skill" and (n.get("label") or "").lower() in keep_labels:
-                keep_ids.add(n["id"])
-            if n.get("node_type") == "cluster":
-                keep_ids.add(n["id"])
-            if n.get("node_type") == "role":
-                keep_ids.add(n["id"])
-        data["nodes"] = [n for n in data["nodes"] if n["id"] in keep_ids]
-        data["edges"] = [
-            e
-            for e in data["edges"]
-            if e["source"] in keep_ids and e["target"] in keep_ids
-        ]
-        data["n_nodes"] = len(data["nodes"])
-        data["n_edges"] = len(data["edges"])
-
-    if data["nodes"]:
-        html = render_multiverse_html(data, height="620px", role_order=[target])
-        components.html(html, height=640, scrolling=False)
-        st.caption(
-            "На карте: бирюзовый оттенок ≈ уже есть, розовый ≈ в пути обучения, серый ≈ прочий рынок."
-        )
-    else:
-        st.warning("Не удалось построить карту для выбранных навыков.")
 
 
 def main() -> None:

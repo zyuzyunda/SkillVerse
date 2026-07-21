@@ -261,6 +261,165 @@ def list_market_clusters() -> list[str]:
     )
 
 
+def pipeline_kg_stats() -> dict[str, Any]:
+    """KPI market-KG после пайплайна sections → extract → governance."""
+    with SessionLocal() as session:
+        from sqlalchemy import func
+
+        from src.db.models import KgQuarantine, SkillCanonical
+
+        n_canon = session.scalar(select(func.count()).select_from(SkillCanonical)) or 0
+        n_role_skill = (
+            session.scalar(
+                select(func.count())
+                .select_from(GraphEdge)
+                .where(GraphEdge.edge_type == "ROLE_REQUIRES_SKILL")
+            )
+            or 0
+        )
+        n_cooc = (
+            session.scalar(
+                select(func.count())
+                .select_from(GraphEdge)
+                .where(GraphEdge.edge_type == "SKILL_CO_OCCURS")
+            )
+            or 0
+        )
+        n_quarantine = (
+            session.scalar(
+                select(func.count())
+                .select_from(KgQuarantine)
+                .where(KgQuarantine.item_type == "summary")
+            )
+            or 0
+        )
+        n_skills = (
+            session.scalar(
+                select(func.count())
+                .select_from(GraphNode)
+                .where(GraphNode.node_type == "skill")
+            )
+            or 0
+        )
+    return {
+        "canonical_skills": int(n_canon),
+        "skill_nodes": int(n_skills),
+        "role_skill_edges": int(n_role_skill),
+        "cooc_edges": int(n_cooc),
+        "quarantine_summaries": int(n_quarantine),
+    }
+
+
+def personal_profile_subgraph(
+    role_group: str,
+    *,
+    have_skills: list[str],
+    gap_skills: list[str] | None = None,
+    min_support: float = 0.10,
+    top_skills: int = 28,
+    include_clusters: bool = True,
+    include_cooc: bool = True,
+    top_cooc: int = 40,
+    expand_cooc_neighbors: bool = True,
+) -> dict[str, Any]:
+    """Подграф целевой роли из KG с пометками have / gap / neighbor.
+
+    Использует рёбра ROLE_REQUIRES_SKILL + SKILL_CO_OCCURS пайплайна.
+    """
+    gap_skills = gap_skills or []
+    have_l = {s.strip().lower() for s in have_skills if s and s.strip()}
+    gap_l = {s.strip().lower() for s in gap_skills if s and s.strip()} - have_l
+
+    data = role_subgraph(
+        role_group,
+        top_skills=top_skills,
+        min_support=min_support,
+        include_clusters=include_clusters,
+        include_cooc=include_cooc,
+        top_cooc=top_cooc,
+    )
+    if not data.get("nodes"):
+        return data
+
+    # расширить соседями cooc вокруг «есть у меня»
+    if include_cooc and expand_cooc_neighbors and have_l:
+        g = load_networkx(edge_types=["SKILL_CO_OCCURS"])
+        keep_ids = {n["id"] for n in data["nodes"]}
+        have_ids = {
+            n["id"]
+            for n in data["nodes"]
+            if n.get("node_type") == "skill"
+            and (n.get("label") or "").lower() in have_l
+        }
+        extra_edges: list[dict[str, Any]] = []
+        for hid in have_ids:
+            if hid not in g:
+                continue
+            for nbr in g.neighbors(hid):
+                ed = g.get_edge_data(hid, nbr) or {}
+                if ed.get("edge_type") != "SKILL_CO_OCCURS":
+                    continue
+                if nbr not in keep_ids:
+                    nd = dict(g.nodes[nbr])
+                    data["nodes"].append(
+                        {
+                            "id": nbr,
+                            "label": nd.get("label") or nbr,
+                            "node_type": nd.get("node_type") or "skill",
+                            "cluster": nd.get("cluster"),
+                            "x": 0.0,
+                            "y": 0.0,
+                            "support": float(nd.get("support") or 0),
+                            "status": "neighbor",
+                        }
+                    )
+                    keep_ids.add(nbr)
+                extra_edges.append(
+                    {
+                        "source": hid,
+                        "target": nbr,
+                        "edge_type": "SKILL_CO_OCCURS",
+                        "weight": float(ed.get("weight") or 0),
+                        "support": float(ed.get("support") or 0),
+                    }
+                )
+        # дедуп рёбер
+        seen = {(e["source"], e["target"], e.get("edge_type")) for e in data["edges"]}
+        seen |= {(e["target"], e["source"], e.get("edge_type")) for e in data["edges"]}
+        for e in extra_edges:
+            key = (e["source"], e["target"], e.get("edge_type"))
+            key_r = (e["target"], e["source"], e.get("edge_type"))
+            if key in seen or key_r in seen:
+                continue
+            data["edges"].append(e)
+            seen.add(key)
+
+    nodes = []
+    for n in data["nodes"]:
+        nn = dict(n)
+        if nn.get("node_type") == "skill":
+            label = (nn.get("label") or "").lower()
+            if label in have_l:
+                nn["status"] = "have"
+                nn["trend"] = 0.15  # зелёный в multiverse-палитре
+                nn["bridge_roles"] = 1
+            elif label in gap_l:
+                nn["status"] = "gap"
+                nn["trend"] = -0.15  # розовый
+                nn["bridge_roles"] = 1
+            else:
+                nn.setdefault("status", "neighbor")
+                nn.setdefault("trend", 0.0)
+                nn.setdefault("bridge_roles", 1)
+        nodes.append(nn)
+    data = dict(data)
+    data["nodes"] = nodes
+    data["n_nodes"] = len(nodes)
+    data["n_edges"] = len(data["edges"])
+    data["pipeline"] = "sections→extract→governance"
+    return data
+
+
 def filtered_market_graph(
     *,
     roles: Optional[list[str]] = None,

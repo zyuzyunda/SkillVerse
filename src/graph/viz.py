@@ -278,6 +278,13 @@ MULTIVERSE_THEME = {
 
 
 def _trend_skill_color(node: dict[str, Any]) -> dict[str, Any]:
+    status = (node.get("status") or "").lower()
+    if status == "have":
+        return MULTIVERSE_THEME["skill_up"]
+    if status == "gap":
+        return MULTIVERSE_THEME["skill_down"]
+    if status == "neighbor":
+        return MULTIVERSE_THEME["skill_flat"]
     trend = float(node.get("trend") or 0)
     bridges = int(node.get("bridge_roles") or 1)
     if bridges >= 3:
@@ -325,6 +332,8 @@ def multiverse_to_pyvis_html(
         if ntype == "skill":
             title_parts.append(f"support: {support:.0%}")
             title_parts.append(f"тренд: {trend:+.1%}")
+            if node.get("status"):
+                title_parts.append(f"статус: {node['status']}")
             if bridges > 1:
                 title_parts.append(f"мост между {bridges} ролями")
         if node.get("cluster"):
