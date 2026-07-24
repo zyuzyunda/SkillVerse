@@ -1,172 +1,199 @@
 # SkillVerse
 
-AI-платформа управления компетенциями: граф знаний рынка DS/ML/AI + LLM-извлечение навыков + HR/career UI (Streamlit).
+AI-платформа управления компетенциями: граф знаний рынка труда (роль ↔ навык, навык ↔ навык) по вакансиям hh.ru, LLM-извлечение навыков и HR/career UI на Streamlit.
 
-Репозиторий: [github.com/zyuzyunda/SkillVerse](https://github.com/zyuzyunda/SkillVerse).
+Репозиторий: [github.com/zyuzyunda/SkillVerse](https://github.com/zyuzyunda/SkillVerse)
 
-**Архитектура (мультиагентная, гибрид LLM + правила):**  
-[docs/architecture_multiagent.md](docs/architecture_multiagent.md)
+## Что умеет
 
-Новый пайплайн (Блок 1 · секции) разрабатывается в ветке `feature/pipeline-block1`:
-```bash
-git checkout feature/pipeline-block1
-PYTHONPATH=. python -m src.market.split_sections --source hh --resume
-PYTHONPATH=. streamlit run app_streamlit.py
-# раздел «Блок 1 · Секции»
+- **Ingest** — сбор вакансий через официальный API hh.ru (OAuth приложения) с HTML-fallback
+- **Секции** — выделение обязанностей и требований (правила → LLM на сложных текстах)
+- **Extract** — LLM-извлечение навыков из очищенных секций
+- **Market KG** — рёбра `ROLE_REQUIRES_SKILL` и `SKILL_CO_OCCURS` (support + PMI)
+- **Governance** — нормализация, фильтры шума, карантин слабых связей
+- **UI** — Мультивселенная, Моя вселенная, HR Dashboard, блок Governance
+- **Org-слой** — синтетика сотрудников, skill gaps, рекомендации
+
+## Архитектура
+
+Мультиагентная схема с **гибридным** исполнением: LLM только там, где нужна семантика текста; парсинг, статистика связей и основная нормализация — детерминированный код.
+
+```mermaid
+flowchart TB
+  subgraph B1["Блок 1 · Ingest"]
+    A1["Parser · API hh.ru"]
+    A2["Section Splitter · rules → LLM"]
+    RAW[(vacancies)]
+    SEC[(секции)]
+    A1 --> RAW --> A2 --> SEC
+  end
+
+  subgraph B2["Блок 2 · Extract & Link"]
+    A3["Skill Extractor · LLM"]
+    A4["Relation Builder · PMI"]
+    SK[(vacancy_skills)]
+    EDGES[(рёбра KG)]
+    SEC --> A3 --> SK --> A4 --> EDGES
+  end
+
+  subgraph B3["Блок 3 · Governance"]
+    A5["SAA · canonical"]
+    A6["CRA · фильтры"]
+    A7["Evaluator · quarantine"]
+    KG[(graph_nodes / edges)]
+    EDGES --> A5 --> A6 --> A7 --> KG
+  end
+
+  KG --> UI[Streamlit]
 ```
 
-## Запуск через Docker (рекомендуется)
+Подробнее: [docs/architecture_multiagent.md](docs/architecture_multiagent.md) · [docs/report_technical_summary.md](docs/report_technical_summary.md)
 
-Используется **Colima** + Docker CLI (без Docker Desktop).
+## Стек
+
+| Слой | Технологии |
+|------|------------|
+| Backend | Python 3.11+, SQLAlchemy, Pydantic |
+| БД | PostgreSQL 16 |
+| Граф | NetworkX |
+| LLM | Ollama (локально) / Groq |
+| UI | Streamlit, PyVis |
+| Infra | Docker Compose |
+
+## Быстрый старт
+
+### 1. Клон и окружение
 
 ```bash
-# если Colima ещё не запущена
-colima start
+git clone https://github.com/zyuzyunda/SkillVerse.git
+cd SkillVerse
 
-cd "AI платформа управления компетенциями предприятия"
-# или клон: git clone https://github.com/zyuzyunda/SkillVerse.git
+cp .env.example .env
+# при необходимости отредактируйте .env
+```
 
+### 2. Postgres + seed
 
-# поднять Postgres + инициализация схемы + seed вакансий
+```bash
 docker compose up --build
-
-# в фоне:
-# docker compose up --build -d
 ```
 
-Postgres доступен на хосте: **localhost:5433**  
-(порт 5433, чтобы не конфликтовать с Homebrew Postgres на 5432)
+Postgres на хосте: `localhost:5433`
 
-Подключение:
-- user: `competence`
-- password: `competence`
-- db: `competence_platform`
+| Параметр | Значение |
+|----------|----------|
+| user | `competence` |
+| password | `competence` |
+| database | `competence_platform` |
 
-Проверка:
+`DATABASE_URL` в `.env` уже указывает на этот порт.
+
+### 3. Python на хосте
 
 ```bash
-docker compose exec db psql -U competence -d competence_platform \
-  -c "SELECT role_group, count(*) FROM vacancies GROUP BY 1 ORDER BY 2 DESC;"
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Повторный seed (Experiments, авг–сен 2025):
+### 4. UI
 
 ```bash
-SEED_ON_START=1 docker compose run --rm app
+PYTHONPATH=. streamlit run app_streamlit.py
 ```
 
-Исторический срез из helper (мар–апр 2025):
+Остановка БД: `docker compose down`  
+С удалением данных: `docker compose down -v`
+
+---
+
+## Пайплайн hh.ru
+
+### Credentials
+
+1. Зарегистрируйте приложение на [dev.hh.ru](https://dev.hh.ru)
+2. В `.env` укажите:
+
+```env
+HH_USER_AGENT=SkillVerse/1.0 (your@email.com)
+HH_CLIENT_ID=...
+HH_CLIENT_SECRET=...
+# опционально готовый токен:
+# HH_ACCESS_TOKEN=...
+```
+
+Без `HH_CLIENT_*` парсер использует HTML-fallback.
+
+### Полный прогон
 
 ```bash
-# CSV уже в data/HHRU_united.csv
-PYTHONPATH=. python -m src.market.seed_from_hh_united
+# 1. Парсинг
+PYTHONPATH=. python -m src.market.parse_hh
+# smoke: --limit-per-query 5 --max-pages 2
+
+# 2–7. Секции → extract → граф (+ метрики в отчёте)
+./scripts/run_pipeline_hh.sh
 ```
 
-Сборка market-графа (нормализация → canonical → рёбра с трендом):
+По шагам:
 
 ```bash
-# (рекомендуется) LLM-извлечение навыков из description_text hh-вакансий
-# По умолчанию LLM_PROVIDER=auto: Groq → при 403 локальная Ollama (llama3.2:3b)
-# ollama serve && ollama pull llama3.2:3b
-PYTHONPATH=. python -m src.market.extract_skills_llm --source hh --resume
-# только локальная Llama (без VPN); --resume продолжает после Ctrl+C
-# PYTHONPATH=. python -m src.market.extract_skills_llm --provider ollama --resume
-# тест / офлайн-smoke без API:
-# PYTHONPATH=. python -m src.market.extract_skills_llm --limit 5 --provider ollama --no-resume
-# PYTHONPATH=. python -m src.market.extract_skills_llm --limit 20 --mock --no-resume
-
-# граф: key skills + llm_extract → ROLE_REQUIRES_SKILL + SKILL_CO_OCCURS (PMI)
-PYTHONPATH=. python -m src.graph.build_market_graph
-# только РФ:
-# PYTHONPATH=. python -m src.graph.build_market_graph --source hh --source csv_seed --skip-org
-
-docker compose exec db psql -U competence -d competence_platform \
-  -c "SELECT edge_type, count(*) FROM graph_edges GROUP BY 1;"
+PYTHONPATH=. python -m src.market.split_sections --source hh --resume
+PYTHONPATH=. python -m src.market.extract_skills_llm \
+  --provider ollama --from-sections --require-sections --resume
+PYTHONPATH=. python -m src.graph.build_market_graph --source hh --skip-org
 ```
 
-Синтетика сотрудников + org-слой графа:
+LLM по умолчанию: `LLM_PROVIDER=auto` (Groq → при сбое локальная Ollama).  
+Для офлайна: `ollama serve && ollama pull llama3.2:3b`.
+
+### Org-слой и ассистент (опционально)
 
 ```bash
 PYTHONPATH=. python -m src.org.generate_synthetic
 PYTHONPATH=. python -m src.org.build_org_graph
-
-# дефициты роль vs рынок
 PYTHONPATH=. python -m src.org.skill_gaps --role data_science
-PYTHONPATH=. python -m src.org.skill_gaps --role llm_agents
-
-# рекомендации (обучение / курсы / мобильность)
 PYTHONPATH=. python -m src.org.recommendations --role data_science
 
-# HR Dashboard
-PYTHONPATH=. streamlit run app_streamlit.py
-
-# LLM-ассистент (8 сценариев; без GROQ_API_KEY — ответ по фактам)
 PYTHONPATH=. python -m src.llm.ask --list
-PYTHONPATH=. python -m src.llm.ask --scenario gaps_ds --no-llm
 PYTHONPATH=. python -m src.llm.ask -q "Кого обучить по MLOps?"
 ```
 
-Парсер hh.ru (официальный API через OAuth приложения + HTML fallback):
+---
 
-```bash
-# в .env: HH_CLIENT_ID, HH_CLIENT_SECRET, HH_USER_AGENT=AppName/1.0 (email@…)
-# тест
-PYTHONPATH=. python -m src.market.parse_hh --limit-per-query 5 --max-pages 2
+## Структура репозитория
 
-# полный прогон (Россия, DS/ML/AI) — при наличии credentials идёт через api.hh.ru
-PYTHONPATH=. python -m src.market.parse_hh
-
-# только роли
-PYTHONPATH=. python -m src.market.parse_hh --role data_science --role mlops
-
-# принудительно HTML (если API недоступен)
-PYTHONPATH=. python -m src.market.parse_hh --html --limit-per-query 5
-
-docker compose --profile parse run --rm parser --limit-per-query 5
+```
+├── app_streamlit.py          # UI (HR / Мультивселенная / Governance)
+├── docker-compose.yml        # Postgres + init/seed + parser profile
+├── docs/                     # архитектура и техническая справка
+├── scripts/
+│   ├── run_pipeline_hh.sh    # оркестрация блоков 2–7
+│   └── update_report_metrics.py
+├── data/                     # seed CSV (рынок)
+└── src/
+    ├── market/               # parse_hh, sections, LLM extract
+    ├── graph/                # normalizer, market KG, governance
+    ├── org/                  # сотрудники, gaps, рекомендации
+    ├── llm/                  # сценарии ассистента
+    └── db/                   # модели Postgres
 ```
 
-Работа с Python на хосте против Docker-БД:
+## Конфигурация
 
-```bash
-cp .env.example .env   # DATABASE_URL -> localhost:5433
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-PYTHONPATH=. python -m src.market.parse_hh --limit-per-query 3
-```
+Основные переменные — в [`.env.example`](.env.example):
 
-Остановка:
+| Переменная | Назначение |
+|------------|------------|
+| `DATABASE_URL` | Postgres (хост → `:5433`) |
+| `HH_CLIENT_ID` / `HH_CLIENT_SECRET` | OAuth приложения hh.ru |
+| `HH_USER_AGENT` | `AppName/1.0 (email)` — требование API |
+| `HH_DATE_FROM` | Нижняя граница `published_at` |
+| `GROQ_API_KEY` / `OLLAMA_*` | Провайдер LLM |
+| `LLM_PROVIDER` | `auto` \| `groq` \| `ollama` |
 
-```bash
-docker compose down
-# с удалением данных БД:
-# docker compose down -v
-```
+Секреты и токены (`.env`, `.hh_app_token`) в git не коммитятся.
 
-## Структура
+## Лицензия
 
-- `docker-compose.yml` — Postgres + app (init/seed) + parser
-- `Dockerfile` — образ приложения
-- `data/` — seed рынка (DS/ML/AI)
-- `docs/` — архитектура (мультиагентный пайплайн)
-- `src/db` — модели Postgres
-- `src/market` — парсер hh.ru, seed, LLM-извлечение навыков (`extract_skills_llm`)
-- `src/graph` — нормализация навыков и market-граф
-- `src/org` — синтетика сотрудников, org-граф, дефициты, рекомендации
-- `src/llm` — сценарии и ассистент (Groq / fallback)
-- `app_streamlit.py` — HR Dashboard / Мультивселенная / полный граф с фильтрами
-
-Пайплайн навыков (РФ): description → LLM JSON (`llm_extract`, Ollama/Groq) ∪ `hh_key_skills` →
-нормализация → canonical → рёбра `ROLE_REQUIRES_SKILL` и `SKILL_CO_OCCURS` (связки вроде Python–pandas–numpy).
-Подробнее: [docs/architecture_multiagent.md](docs/architecture_multiagent.md).
-
-## Примечание про hh.ru
-
-С зарегистрированным приложением на [dev.hh.ru](https://dev.hh.ru) парсер
-получает **токен приложения** (`client_credentials`) и ходит в `api.hh.ru`
-с `Authorization: Bearer …` и корректным `HH_USER_AGENT`.
-
-Без `HH_CLIENT_ID` / `HH_CLIENT_SECRET` остаётся HTML-fallback
-(`hh.ru/search/vacancy` + карточка вакансии).
-
-Seed CSV и Kaggle AI Jobs — дополнительные корпуса.
-Тренды в графе считаются по годам `published_at`.
+Пока не указана — при использовании кода и данных hh.ru соблюдайте [условия API hh.ru](https://dev.hh.ru) и не публикуйте персональные данные из вакансий.
