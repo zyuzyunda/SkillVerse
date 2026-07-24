@@ -17,11 +17,16 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg2://competence:competence@localhost:5433/competence_platform"
 
-    hh_user_agent: str = "CompetencePlatform/1.0 (zyuzyunda@gmail.com)"
+    # hh.ru API (https://dev.hh.ru) — токен приложения для легального парсинга
+    hh_user_agent: str = "SkillVerse/1.0 (contact@example.com)"
+    hh_client_id: str = ""
+    hh_client_secret: str = ""
+    hh_access_token: str = ""  # опционально: готовый app token из кабинета
     hh_area: int = 113
     hh_request_delay_sec: float = 0.6
-    hh_max_pages_per_query: int = 25
-    hh_per_page: int = 50
+    hh_max_pages_per_query: int = 20  # API: max ~2000 = 20×100
+    hh_per_page: int = 100  # API max 100
+    hh_date_from: str = ""  # ISO date, напр. 2025-01-01
 
     groq_api_key: str = ""
     llm_model: str = "llama-3.3-70b-versatile"

@@ -21,7 +21,7 @@ def ensure_schema() -> None:
 def upsert_vacancy(session: Session, payload: dict, parse_run_id: int) -> tuple[Vacancy, bool]:
     """Возвращает (vacancy, created)."""
     existing = session.scalar(select(Vacancy).where(Vacancy.hh_id == payload["hh_id"]))
-    key_skills = payload.pop("key_skills", [])
+    key_skills = payload.pop("key_skills", []) or []
 
     if existing is None:
         vacancy = Vacancy(**payload, parse_run_id=parse_run_id)
@@ -34,11 +34,30 @@ def upsert_vacancy(session: Session, payload: dict, parse_run_id: int) -> tuple[
             setattr(vacancy, key, value)
         vacancy.parse_run_id = parse_run_id
         created = False
-        vacancy.skills = [s for s in vacancy.skills if s.source != "hh_key_skills"]
 
+    # явное удаление, иначе UniqueViolation при «замене» через relationship
+    session.query(VacancySkill).filter(
+        VacancySkill.vacancy_id == vacancy.id,
+        VacancySkill.source == "hh_key_skills",
+    ).delete(synchronize_session=False)
+    session.flush()
+
+    seen: set[str] = set()
     for skill_name in key_skills:
-        vacancy.skills.append(
-            VacancySkill(skill_name=skill_name, source="hh_key_skills", skill_type="tools")
+        name = (skill_name or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        session.add(
+            VacancySkill(
+                vacancy_id=vacancy.id,
+                skill_name=name,
+                source="hh_key_skills",
+                skill_type="tools",
+            )
         )
     return vacancy, created
 
@@ -49,17 +68,24 @@ def run_parser(
     limit_per_query: Optional[int] = None,
     max_pages: Optional[int] = None,
     dry_run: bool = False,
-    prefer_html: bool = True,
+    prefer_html: Optional[bool] = None,
+    date_from: Optional[str] = None,
 ) -> None:
     ensure_schema()
     queries = list(queries or SEARCH_QUERIES)
     client = HHClient(prefer_html=prefer_html)
+    source_note = "html" if client.prefer_html else "api"
+    from src.config import settings as _settings
+
+    effective_date = date_from if date_from is not None else (_settings.hh_date_from or None)
+    if effective_date:
+        effective_date = str(effective_date).strip() or None
 
     with SessionLocal() as session:
         run = ParseRun(
             status="running",
             queries=[{"text": q.text, "role_group": q.role_group} for q in queries],
-            notes="source=html" if prefer_html else "source=auto",
+            notes=f"source={source_note}; date_from={effective_date or '-'}",
         )
         session.add(run)
         session.commit()
@@ -78,6 +104,7 @@ def run_parser(
                         query.text,
                         search_field=query.search_field,
                         max_pages=max_pages,
+                        date_from=effective_date,
                     )
                 except HHForbiddenError as exc:
                     print(f"поиск недоступен: {exc}")
@@ -118,12 +145,12 @@ def run_parser(
             run.vacancies_fetched = fetched
             run.vacancies_upserted = upserted
             run.finished_at = datetime.now(timezone.utc)
-            note = f"errors={errors}; source={'html' if prefer_html else 'auto'}"
+            note = f"errors={errors}; source={source_note}"
             run.notes = ((run.notes or "") + "; " + note).strip("; ")
             session.commit()
             print(
                 f"\nГотово. fetched={fetched}, created={upserted}, "
-                f"errors={errors}, run_id={run.id}"
+                f"errors={errors}, run_id={run.id}, source={source_note}"
             )
         except Exception as exc:
             run.status = "failed"
@@ -164,8 +191,19 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Не писать в БД")
     parser.add_argument(
         "--try-api",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="API hh.ru с OAuth приложения (default: auto — API если есть HH_CLIENT_*)",
+    )
+    parser.add_argument(
+        "--html",
         action="store_true",
-        help="Сначала пробовать api.hh.ru (обычно 403), иначе сразу HTML",
+        help="Принудительно HTML-скрапинг (без API)",
+    )
+    parser.add_argument(
+        "--date-from",
+        default=None,
+        help="ISO дата нижней границы публикации, напр. 2025-01-01 (только API)",
     )
     args = parser.parse_args()
 
@@ -179,12 +217,23 @@ def main() -> None:
     if not queries:
         raise SystemExit("Нет запросов после фильтров --query/--role")
 
+    prefer_html: Optional[bool]
+    if args.html:
+        prefer_html = True
+    elif args.try_api is True:
+        prefer_html = False
+    elif args.try_api is False:
+        prefer_html = True
+    else:
+        prefer_html = None  # auto
+
     run_parser(
         queries=queries,
         limit_per_query=args.limit_per_query,
         max_pages=args.max_pages,
         dry_run=args.dry_run,
-        prefer_html=not args.try_api,
+        prefer_html=prefer_html,
+        date_from=args.date_from,
     )
 
 

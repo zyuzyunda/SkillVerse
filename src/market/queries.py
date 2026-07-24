@@ -1,5 +1,5 @@
 """
-Поисковые запросы hh.ru для сегмента Data Science / ML / AI / Agents / RnD.
+Поисковые запросы hh.ru для сегмента Data / Analytics / ML / AI / Agents / RnD.
 role_group используется для аналитики внутри платформы.
 """
 
@@ -17,6 +17,43 @@ class SearchQuery:
 
 # География фиксируется в settings (HH_AREA=113 — Россия).
 SEARCH_QUERIES: list[SearchQuery] = [
+    # Data Analytics
+    SearchQuery("Data Analyst", "data_analytics"),
+    SearchQuery("Аналитик данных", "data_analytics"),
+    SearchQuery("Дата аналитик", "data_analytics"),
+    SearchQuery("Data Analytics", "data_analytics"),
+    SearchQuery("Junior Data Analyst", "data_analytics"),
+    SearchQuery("Senior Data Analyst", "data_analytics"),
+    SearchQuery("Аналитик DWH", "data_analytics"),
+    SearchQuery("SQL аналитик", "data_analytics"),
+    # Product / Marketing analytics
+    SearchQuery("Product Analyst", "product_analytics"),
+    SearchQuery("Продуктовый аналитик", "product_analytics"),
+    SearchQuery("Product Analytics", "product_analytics"),
+    SearchQuery("Маркетинговый аналитик", "product_analytics"),
+    SearchQuery("Marketing Analyst", "product_analytics"),
+    SearchQuery("Web Analyst", "product_analytics"),
+    SearchQuery("Веб-аналитик", "product_analytics"),
+    # BI
+    SearchQuery("BI Analyst", "bi_analytics"),
+    SearchQuery("BI-аналитик", "bi_analytics"),
+    SearchQuery("BI аналитик", "bi_analytics"),
+    SearchQuery("Business Intelligence", "bi_analytics"),
+    SearchQuery("BI Developer", "bi_analytics"),
+    SearchQuery("Power BI", "bi_analytics"),
+    SearchQuery("Tableau", "bi_analytics"),
+    # Business / Systems analyst (смежные)
+    SearchQuery("Бизнес-аналитик", "business_analytics"),
+    SearchQuery("Business Analyst", "business_analytics"),
+    SearchQuery("Системный аналитик", "business_analytics"),
+    SearchQuery("Systems Analyst", "business_analytics"),
+    # Data Engineering
+    SearchQuery("Data Engineer", "data_engineering"),
+    SearchQuery("Дата инженер", "data_engineering"),
+    SearchQuery("Инженер данных", "data_engineering"),
+    SearchQuery("ETL Developer", "data_engineering"),
+    SearchQuery("DWH Engineer", "data_engineering"),
+    SearchQuery("Data Platform Engineer", "data_engineering"),
     # Data Science
     SearchQuery("Data Scientist", "data_science"),
     SearchQuery("Дата-сайентист", "data_science"),

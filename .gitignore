@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 venv/
 .env
+.hh_app_token
+logs/
 .DS_Store
 *.pkl
 .pytest_cache/

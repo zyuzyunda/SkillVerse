@@ -1,4 +1,4 @@
-"""Клиент hh.ru: HTML-поиск и карточки вакансий (api.hh.ru/vacancies сейчас 403)."""
+"""Клиент hh.ru: официальный API (OAuth приложения) + HTML fallback."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import re
 import time
 from datetime import datetime
 from html import unescape
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urljoin
 
@@ -17,6 +18,9 @@ from src.config import settings
 
 HH_API_BASE = "https://api.hh.ru/"
 HH_SITE = "https://hh.ru"
+HH_OAUTH_TOKEN_URL = "https://hh.ru/oauth/token"
+# токен приложения выдаётся редко — кэш на диск (в .gitignore)
+HH_TOKEN_PATH = Path(__file__).resolve().parents[2] / ".hh_app_token"
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -94,7 +98,25 @@ ENTITIES = {
 
 
 class HHForbiddenError(RuntimeError):
-    """API/сайт недоступен (антибот / VPN interstitial)."""
+    """API/сайт недоступен (антибот / VPN interstitial / OAuth)."""
+
+
+def _normalize_user_agent(raw: str) -> str:
+    """HH требует AppName/Version (email@domain)."""
+    ua = (raw or "").strip()
+    if not ua:
+        return "SkillVerse/1.0 (contact@example.com)"
+    # SkillVerse(email) → SkillVerse/1.0 (email)
+    m = re.fullmatch(r"([A-Za-z0-9._-]+)\(([^)]+@[^)]+)\)", ua)
+    if m:
+        return f"{m.group(1)}/1.0 ({m.group(2)})"
+    if re.search(r"\S+/\S+\s+\([^)]+@[^)]+\)", ua):
+        return ua
+    # уже есть email в скобках без версии
+    m2 = re.fullmatch(r"([A-Za-z0-9._-]+)\s+\(([^)]+@[^)]+)\)", ua)
+    if m2:
+        return f"{m2.group(1)}/1.0 ({m2.group(2)})"
+    return ua
 
 
 def extract_skills_from_text(text: str) -> list[str]:
@@ -300,14 +322,30 @@ def parse_vacancy_html(html: str, vacancy_id: str) -> dict[str, Any]:
 
 
 class HHClient:
-    def __init__(self, *, prefer_html: bool = True) -> None:
-        self.prefer_html = prefer_html
+    def __init__(self, *, prefer_html: Optional[bool] = None) -> None:
         self.session = requests.Session()
-        self.api_ua = settings.hh_user_agent
+        self.api_ua = _normalize_user_agent(settings.hh_user_agent)
         self.browser_ua = BROWSER_UA
         self.delay = settings.hh_request_delay_sec
+        self._access_token: Optional[str] = (settings.hh_access_token or "").strip() or None
         self._api_vacancies_blocked: Optional[bool] = None
+        # API first, если есть client credentials / token; иначе HTML
+        if prefer_html is None:
+            prefer_html = not self._has_api_credentials()
+        self.prefer_html = prefer_html
         self._configure_browser_headers()
+
+    def _has_api_credentials(self) -> bool:
+        if self._access_token:
+            return True
+        if (settings.hh_access_token or "").strip():
+            return True
+        if _load_token_cache():
+            return True
+        return bool(
+            (settings.hh_client_id or "").strip()
+            and (settings.hh_client_secret or "").strip()
+        )
 
     def _configure_browser_headers(self) -> None:
         self.session.headers.update(
@@ -321,6 +359,67 @@ class HHClient:
 
     def _sleep(self) -> None:
         time.sleep(self.delay)
+
+    def ensure_access_token(self, *, force: bool = False) -> str:
+        """Токен приложения: .env → кэш-файл → client_credentials."""
+        if self._access_token and not force:
+            return self._access_token
+
+        if not force:
+            env_token = (settings.hh_access_token or "").strip()
+            if env_token:
+                self._access_token = env_token
+                return env_token
+            cached = _load_token_cache()
+            if cached:
+                self._access_token = cached
+                return cached
+
+        client_id = (settings.hh_client_id or "").strip()
+        client_secret = (settings.hh_client_secret or "").strip()
+        if not client_id or not client_secret:
+            if self._access_token:
+                return self._access_token
+            raise HHForbiddenError(
+                "Нет HH_CLIENT_ID / HH_CLIENT_SECRET (или HH_ACCESS_TOKEN / .hh_app_token). "
+                "Зарегистрируйте приложение на https://dev.hh.ru"
+            )
+        resp = requests.post(
+            HH_OAUTH_TOKEN_URL,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            headers={
+                "User-Agent": self.api_ua,
+                "HH-User-Agent": self.api_ua,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            # токен уже выдан недавно — используем кэш / admin token
+            if "refresh too early" in (resp.text or "") or resp.status_code == 403:
+                cached = _load_token_cache() or (settings.hh_access_token or "").strip()
+                if cached:
+                    self._access_token = cached
+                    return cached
+                raise HHForbiddenError(
+                    "Токен приложения уже выдан и ещё нельзя обновить. "
+                    "Скопируйте access_token из https://dev.hh.ru/admin в HH_ACCESS_TOKEN "
+                    f"или в файл {HH_TOKEN_PATH.name}. Ответ: {resp.text[:200]}"
+                )
+            raise HHForbiddenError(
+                f"OAuth token failed HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+        data = resp.json()
+        token = (data.get("access_token") or "").strip()
+        if not token:
+            raise HHForbiddenError(f"OAuth response without access_token: {data}")
+        self._access_token = token
+        _save_token_cache(token)
+        return token
 
     def _check_vpn_interstitial(self, resp: requests.Response) -> None:
         if re.search(r"/vpnche{1,2}ck", resp.url or "", flags=re.I):
@@ -349,22 +448,39 @@ class HHClient:
         self._sleep()
         return resp.text
 
+    def _api_headers(self) -> dict[str, str]:
+        token = self.ensure_access_token()
+        return {
+            "User-Agent": self.api_ua,
+            "HH-User-Agent": self.api_ua,
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+
     def _api_get(self, path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         url = urljoin(HH_API_BASE, path.lstrip("/"))
         resp = self.session.get(
             url,
             params=params,
             timeout=30,
-            headers={
-                "User-Agent": self.api_ua,
-                "HH-User-Agent": self.api_ua,
-                "Accept": "application/json",
-            },
+            headers=self._api_headers(),
         )
+        if resp.status_code == 401:
+            # токен протух / отозван — один раз обновим
+            self.ensure_access_token(force=True)
+            resp = self.session.get(
+                url,
+                params=params,
+                timeout=30,
+                headers=self._api_headers(),
+            )
         if resp.status_code == 403:
             raise HHForbiddenError(f"api.hh.ru forbidden: {resp.text[:200]}")
         if resp.status_code == 400 and "bad_user_agent" in resp.text:
-            raise HHForbiddenError(f"api.hh.ru bad_user_agent: {resp.text[:200]}")
+            raise HHForbiddenError(
+                f"api.hh.ru bad_user_agent: {resp.text[:200]}. "
+                "HH_USER_AGENT должен быть вида AppName/1.0 (email@domain.com)"
+            )
         if resp.status_code == 429:
             time.sleep(5)
             raise requests.ConnectionError("api.hh.ru rate limited")
@@ -375,6 +491,9 @@ class HHClient:
     def _api_vacancies_available(self) -> bool:
         if self._api_vacancies_blocked is not None:
             return not self._api_vacancies_blocked
+        if not self._has_api_credentials():
+            self._api_vacancies_blocked = True
+            return False
         try:
             self._api_get(
                 "vacancies",
@@ -382,7 +501,8 @@ class HHClient:
             )
             self._api_vacancies_blocked = False
             return True
-        except Exception:
+        except Exception as exc:
+            print(f"api.hh.ru недоступен, HTML fallback: {exc}")
             self._api_vacancies_blocked = True
             return False
 
@@ -394,14 +514,23 @@ class HHClient:
         search_field: str = "name",
         max_pages: Optional[int] = None,
         per_page: Optional[int] = None,
+        date_from: Optional[str] = None,
     ) -> list[str]:
         area = area if area is not None else settings.hh_area
         max_pages = max_pages if max_pages is not None else settings.hh_max_pages_per_query
         per_page = per_page if per_page is not None else settings.hh_per_page
+        date_from = (date_from if date_from is not None else settings.hh_date_from) or None
+        if date_from:
+            date_from = str(date_from).strip() or None
 
         use_api = (not self.prefer_html) and self._api_vacancies_available()
         if use_api:
-            return self._search_ids_api(text, area, search_field, max_pages, per_page)
+            # API: максимум 100 на страницу, глубина ≤ 2000
+            per_page = min(int(per_page), 100)
+            max_pages = min(int(max_pages), max(1, 2000 // per_page))
+            return self._search_ids_api(
+                text, area, search_field, max_pages, per_page, date_from=date_from
+            )
         return self._search_ids_html(text, area, search_field, max_pages, per_page)
 
     def _search_ids_api(
@@ -411,22 +540,24 @@ class HHClient:
         search_field: str,
         max_pages: int,
         per_page: int,
+        *,
+        date_from: Optional[str] = None,
     ) -> list[str]:
         ids: list[str] = []
         for page in range(max_pages):
             if page * per_page >= 2000:
                 break
-            data = self._api_get(
-                "vacancies",
-                params={
-                    "text": text,
-                    "area": area,
-                    "page": page,
-                    "per_page": per_page,
-                    "search_field": search_field,
-                    "order_by": "publication_time",
-                },
-            )
+            params: dict[str, Any] = {
+                "text": text,
+                "area": area,
+                "page": page,
+                "per_page": per_page,
+                "search_field": search_field,
+                "order_by": "publication_time",
+            }
+            if date_from:
+                params["date_from"] = date_from
+            data = self._api_get("vacancies", params=params)
             items = data.get("items") or []
             if not items:
                 break
@@ -485,6 +616,24 @@ class HHClient:
                 self._api_vacancies_blocked = True
         html = self._get_html(f"{HH_SITE}/vacancy/{vacancy_id}")
         return parse_vacancy_html(html, vacancy_id)
+
+
+def _load_token_cache() -> Optional[str]:
+    try:
+        if HH_TOKEN_PATH.is_file():
+            token = HH_TOKEN_PATH.read_text(encoding="utf-8").strip()
+            return token or None
+    except OSError:
+        return None
+    return None
+
+
+def _save_token_cache(token: str) -> None:
+    try:
+        HH_TOKEN_PATH.write_text(token.strip() + "\n", encoding="utf-8")
+        HH_TOKEN_PATH.chmod(0o600)
+    except OSError as exc:
+        print(f"warn: не удалось сохранить {HH_TOKEN_PATH.name}: {exc}")
 
 
 def _dedupe(ids: list[str]) -> list[str]:

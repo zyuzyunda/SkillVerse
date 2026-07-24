@@ -106,17 +106,21 @@ PYTHONPATH=. python -m src.llm.ask --scenario gaps_ds --no-llm
 PYTHONPATH=. python -m src.llm.ask -q "Кого обучить по MLOps?"
 ```
 
-Парсер hh.ru (HTML-поиск; `api.hh.ru/vacancies` сейчас отдаёт 403):
+Парсер hh.ru (официальный API через OAuth приложения + HTML fallback):
 
 ```bash
+# в .env: HH_CLIENT_ID, HH_CLIENT_SECRET, HH_USER_AGENT=AppName/1.0 (email@…)
 # тест
 PYTHONPATH=. python -m src.market.parse_hh --limit-per-query 5 --max-pages 2
 
-# полный прогон (Россия, DS/ML/AI)
+# полный прогон (Россия, DS/ML/AI) — при наличии credentials идёт через api.hh.ru
 PYTHONPATH=. python -m src.market.parse_hh
 
 # только роли
 PYTHONPATH=. python -m src.market.parse_hh --role data_science --role mlops
+
+# принудительно HTML (если API недоступен)
+PYTHONPATH=. python -m src.market.parse_hh --html --limit-per-query 5
 
 docker compose --profile parse run --rm parser --limit-per-query 5
 ```
@@ -157,11 +161,12 @@ docker compose down
 
 ## Примечание про hh.ru
 
-`api.hh.ru/vacancies` отвечает `403 forbidden` для программных клиентов
-(антибот на edge, не лечится User-Agent/прокси).
+С зарегистрированным приложением на [dev.hh.ru](https://dev.hh.ru) парсер
+получает **токен приложения** (`client_credentials`) и ходит в `api.hh.ru`
+с `Authorization: Bearer …` и корректным `HH_USER_AGENT`.
 
-Парсер ходит на публичный сайт `hh.ru/search/vacancy` + `hh.ru/vacancy/{id}`
-(HTML + JSON-LD), собирает навыки и описания. Seed CSV остаётся запасным путём.
+Без `HH_CLIENT_ID` / `HH_CLIENT_SECRET` остаётся HTML-fallback
+(`hh.ru/search/vacancy` + карточка вакансии).
 
-Дополнительно: Kaggle AI Jobs (2020–2026) → `python -m src.market.seed_from_kaggle_ai`.
-Тренды в графе считаются по годам `published_at` (без меток early/late).
+Seed CSV и Kaggle AI Jobs — дополнительные корпуса.
+Тренды в графе считаются по годам `published_at`.
